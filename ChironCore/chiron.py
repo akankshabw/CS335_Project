@@ -20,6 +20,7 @@ from interpreter import *
 from irhandler import *
 from fuzzer import *
 import sExecution as se
+import relationalVerifier as rv
 import cfg.cfgBuilder as cfgB
 import submissionDFA as DFASub
 import submissionAI as AISub
@@ -119,6 +120,31 @@ if __name__ == "__main__":
         action="store_true",
         help="Run Symbolic Execution on a Chiron program (seed values with '-d' or '--params' flag needed) to generate test cases along all possible paths.",
     )
+    cmdparser.add_argument(
+        "-rv",
+        "--relationalVerify",
+        action="store_true",
+        help="Check non-interference using relational verification (Tier 1: straight-line).",
+    )
+    cmdparser.add_argument(
+        "-rvl",
+        "--relationalVerifyLoop",
+        action="store_true",
+        help="Check non-interference for programs with a single loop (Tier 2).",
+    )
+    cmdparser.add_argument(
+        "--low_in",
+        default=[],
+        type=ast.literal_eval,
+        help='List of low (public) input variables, e.g. \'[":pub"]\'',
+    )
+    cmdparser.add_argument(
+        "--low_out",
+        default=[],
+        type=ast.literal_eval,
+        help='List of low (public) output variables, e.g. \'[":out"]\'',
+    )
+
     # TODO: add additional arguments for parsing command-line arguments
 
     cmdparser.add_argument(
@@ -256,6 +282,31 @@ if __name__ == "__main__":
         """
         se.symbolicExecutionMain(
             irHandler, args.params, args.constparams, timeLimit=args.timeout
+        )
+
+    if args.relationalVerify:
+        if not args.params:
+            raise RuntimeError(
+                "Relational verification needs all program variables listed. "
+                "Specify using '-d' or '--params' flag, e.g. -d '{\":pub\": 0, \":secret\": 0, \":out\": 0}'"
+            )
+        rv.check_non_interference(
+            irHandler,
+            params=args.params,
+            low_inputs=args.low_in,
+            low_outputs=args.low_out,
+        )
+
+    if args.relationalVerifyLoop:
+        if not args.params:
+            raise RuntimeError(
+                "Relational loop verification needs program variables. Use '-d'."
+            )
+        rv.check_loop_non_interference(
+            irHandler,
+            params=args.params,
+            low_inputs=args.low_in,
+            low_outputs=args.low_out,
         )
 
     if args.fuzz:
