@@ -13,6 +13,7 @@ Turtle extension:
 """
 
 import os
+import re
 from z3 import *
 from ChironAST import ChironAST
 from interfaces.sExecutionInterface import (
@@ -129,6 +130,72 @@ def encode_condition(ctx, cond_stmt):
     _locals = {"z3Vars": ctx}
     exec(f"exp = {temp}", globals(), _locals)
     return _locals["exp"]
+
+
+def _parse_inv_file(progfl):
+    """
+    Look for a sidecar <progfl>.inv file (replace .tl with .inv).
+    Each non-blank, non-comment line is a Chiron expression whose value
+    must be equal across both traces, e.g.:
+        :out
+        :__rep_counter_1
+        :temp - :secret
+    Returns a list of expression strings, or None if no sidecar exists.
+    """
+    if not progfl:
+        return None
+    inv_path = progfl.replace(".tl", ".inv")
+    if not os.path.exists(inv_path):
+        return None
+    exprs = []
+    with open(inv_path) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                exprs.append(line)
+    return exprs if exprs else None
+
+
+def _extract_inv_vars(inv_exprs):
+    """
+    Extract plain variable names (colon stripped) from a list of Chiron
+    expression strings, e.g. [":out", ":temp - :secret"] -> ["out", "temp", "secret"].
+    """
+    vars_found = set()
+    for expr in inv_exprs:
+        for m in re.finditer(r':([a-zA-Z_][a-zA-Z0-9_]*)', expr):
+            vars_found.add(m.group(1))
+    return list(vars_found)
+
+
+def build_relational_invariant(ctx1, ctx2, inv_exprs):
+    """
+    Build invariant from expression strings: assert expr(trace1) == expr(trace2).
+    e.g. ":temp - :secret" asserts (temp_1 - secret_1) == (temp_2 - secret_2).
+    """
+    clauses = []
+    for expr_str in inv_exprs:
+        e_str = expr_str.replace(":", "z3Vars.")
+        e1 = convertExp(ctx1, e_str)
+        e2 = convertExp(ctx2, e_str)
+        if isinstance(e1, (int, float)): e1 = IntVal(int(e1))
+        if isinstance(e2, (int, float)): e2 = IntVal(int(e2))
+        clauses.append(e1 == e2)
+    return And(*clauses)
+
+
+def _show_relational_state(model, inv_exprs, ctx1, ctx2):
+    """Print expression values for both traces — relational invariant counterexample."""
+    for expr_str in inv_exprs:
+        e_str = expr_str.replace(":", "z3Vars.")
+        e1 = convertExp(ctx1, e_str)
+        e2 = convertExp(ctx2, e_str)
+        if isinstance(e1, (int, float)): e1 = IntVal(int(e1))
+        if isinstance(e2, (int, float)): e2 = IntVal(int(e2))
+        v1 = model.eval(e1, model_completion=True)
+        v2 = model.eval(e2, model_completion=True)
+        tag = " <-- DIFFERS" if str(v1) != str(v2) else ""
+        print(f"      ({expr_str}): trace1={v1}, trace2={v2}{tag}")
 
 
 def build_invariant(ctx1, ctx2, inv_var_names):
@@ -304,20 +371,42 @@ def check_loop_non_interference(irHandler, params, low_inputs, low_outputs, inv_
     print(f"  Loop exit    : IR[{exit_idx}]")
     print(f"  Post-loop    : IR[{exit_idx}:{len(irHandler.ir)}]  ({len(post_loop_ir)} statements)")
 
-    # Build invariant variable list
-    if inv_vars is None:
-        inv_vars = [v.replace(":", "") for v in low_inputs + low_outputs]
-        for stmt, _ in irHandler.ir:
-            if isinstance(stmt, ChironAST.AssignmentCommand):
-                v = str(stmt.lvar).replace(":", "")
-                if "__rep_counter_" in v and v not in inv_vars:
-                    inv_vars.append(v)
-        # Turtle heading must also be invariant: equal headings + equal positions
-        # ensures that forward/turn steps produce equal results across traces.
-        if is_turtle and 'turtle_h' not in inv_vars:
-            inv_vars.append('turtle_h')
+    # Check for a relational invariant sidecar (.inv file)
+    inv_exprs = _parse_inv_file(progfl)  # list of expr strings, or None
 
-    print(f"  Invariant    : equal across traces for {inv_vars}")
+    # Build invariant variable list (used when no sidecar, or to seed _fresh_ctx)
+    if inv_vars is None:
+        if inv_exprs is not None:
+            # Variables to create fresh Z3 vars for = all vars mentioned in expressions
+            inv_vars = _extract_inv_vars(inv_exprs)
+            for v in [v.replace(":", "") for v in low_inputs]:
+                if v not in inv_vars:
+                    inv_vars.append(v)
+        else:
+            inv_vars = [v.replace(":", "") for v in low_inputs + low_outputs]
+            for stmt, _ in irHandler.ir:
+                if isinstance(stmt, ChironAST.AssignmentCommand):
+                    v = str(stmt.lvar).replace(":", "")
+                    if "__rep_counter_" in v and v not in inv_vars:
+                        inv_vars.append(v)
+            if is_turtle and 'turtle_h' not in inv_vars:
+                inv_vars.append('turtle_h')
+
+    if inv_exprs is not None:
+        print(f"  Invariant    : relational expressions {inv_exprs}  (from .inv sidecar)")
+    else:
+        print(f"  Invariant    : equal across traces for {inv_vars}")
+
+    def _build_inv(c1, c2):
+        if inv_exprs is not None:
+            return build_relational_invariant(c1, c2, inv_exprs)
+        return build_invariant(c1, c2, inv_vars)
+
+    def _show_inv(m, c1, c2):
+        if inv_exprs is not None:
+            _show_relational_state(m, inv_exprs, c1, c2)
+        else:
+            _show_state(m, inv_vars, c1, c2)
 
     # ------------------------------------------------------------------
     # Encode pre-loop code (gives loop-entry state)
@@ -341,7 +430,7 @@ def check_loop_non_interference(irHandler, params, low_inputs, low_outputs, inv_
     print("\n  --- Check 1: Initialization ---")
     s1 = Solver()
     s1.add(*low_input_eq)
-    s1.add(Not(build_invariant(ctx1_entry, ctx2_entry, inv_vars)))
+    s1.add(Not(_build_inv(ctx1_entry, ctx2_entry)))
     r1 = s1.check()
     _print_check("Initialization", r1,
                  "INV holds at loop entry",
@@ -349,7 +438,7 @@ def check_loop_non_interference(irHandler, params, low_inputs, low_outputs, inv_
     if r1 == sat:
         m = s1.model()
         print("    Counterexample — loop entry state where INV is violated:")
-        _show_state(m, inv_vars, ctx1_entry, ctx2_entry)
+        _show_inv(m, ctx1_entry, ctx2_entry)
 
     # ------------------------------------------------------------------
     # Check 2: Preservation (position invariant)
@@ -373,10 +462,10 @@ def check_loop_non_interference(irHandler, params, low_inputs, low_outputs, inv_
     n_body_steps = _count_turtle_steps(ctx1_post) - pre_body_steps
 
     s2 = Solver()
-    s2.add(build_invariant(ctx1_h, ctx2_h, inv_vars))
+    s2.add(_build_inv(ctx1_h, ctx2_h))
     s2.add(encode_condition(ctx1_h, loop_cond))
     s2.add(encode_condition(ctx2_h, loop_cond))
-    s2.add(Not(build_invariant(ctx1_post, ctx2_post, inv_vars)))
+    s2.add(Not(_build_inv(ctx1_post, ctx2_post)))
     r2 = s2.check()
     _print_check("Preservation", r2,
                  "body preserves INV",
@@ -385,9 +474,9 @@ def check_loop_non_interference(irHandler, params, low_inputs, low_outputs, inv_
         m = s2.model()
         print("    Counterexample — one iteration that breaks INV:")
         print("    Before body (loop head):")
-        _show_state(m, inv_vars, ctx1_h, ctx2_h)
+        _show_inv(m, ctx1_h, ctx2_h)
         print("    After body:")
-        _show_state(m, inv_vars, ctx1_post, ctx2_post)
+        _show_inv(m, ctx1_post, ctx2_post)
 
     # ------------------------------------------------------------------
     # Check 2b: Path safety in loop body  [turtle only]
@@ -402,7 +491,7 @@ def check_loop_non_interference(irHandler, params, low_inputs, low_outputs, inv_
             for i in range(n_body_steps)
         ]
         s2_path = Solver()
-        s2_path.add(build_invariant(ctx1_h, ctx2_h, inv_vars))
+        s2_path.add(_build_inv(ctx1_h, ctx2_h))
         s2_path.add(encode_condition(ctx1_h, loop_cond))
         s2_path.add(encode_condition(ctx2_h, loop_cond))
         s2_path.add(Or(*body_step_diffs))
@@ -437,7 +526,7 @@ def check_loop_non_interference(irHandler, params, low_inputs, low_outputs, inv_
     ])
 
     s3 = Solver()
-    s3.add(build_invariant(ctx1_e, ctx2_e, inv_vars))
+    s3.add(_build_inv(ctx1_e, ctx2_e))
     s3.add(Not(encode_condition(ctx1_e, loop_cond)))
     s3.add(Not(encode_condition(ctx2_e, loop_cond)))
     s3.add(diverge_at_final)
@@ -449,7 +538,7 @@ def check_loop_non_interference(irHandler, params, low_inputs, low_outputs, inv_
         m = s3.model()
         print("    Counterexample — exit state where outputs diverge:")
         print("    At loop exit (INV holds here):")
-        _show_state(m, inv_vars, ctx1_e, ctx2_e)
+        _show_inv(m, ctx1_e, ctx2_e)
         if post_loop_ir:
             print("    After post-loop code:")
             _show_state(m, [v.replace(":", "") for v in low_outputs], ctx1_final, ctx2_final)
@@ -467,7 +556,7 @@ def check_loop_non_interference(irHandler, params, low_inputs, low_outputs, inv_
             for i in range(n_post_steps)
         ]
         s3_path = Solver()
-        s3_path.add(build_invariant(ctx1_e, ctx2_e, inv_vars))
+        s3_path.add(_build_inv(ctx1_e, ctx2_e))
         s3_path.add(Not(encode_condition(ctx1_e, loop_cond)))
         s3_path.add(Not(encode_condition(ctx2_e, loop_cond)))
         s3_path.add(Or(*post_step_diffs))

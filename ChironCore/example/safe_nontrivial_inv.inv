@@ -1,0 +1,7 @@
+# Relational invariant for safe_nontrivial_inv.tl
+# Each line: a Chiron expression that must be equal across both traces.
+# Simple equalities: :out  :__rep_counter_1
+# Non-trivial: :temp - :secret  (equals :pub, which is public, so always equal)
+:out
+:__rep_counter_1
+:temp - :secret
