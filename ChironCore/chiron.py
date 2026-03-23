@@ -295,6 +295,7 @@ if __name__ == "__main__":
             params=args.params,
             low_inputs=args.low_in,
             low_outputs=args.low_out,
+            progfl=args.progfl,
         )
 
     if args.relationalVerifyLoop:
@@ -307,6 +308,7 @@ if __name__ == "__main__":
             params=args.params,
             low_inputs=args.low_in,
             low_outputs=args.low_out,
+            progfl=args.progfl,
         )
 
     if args.fuzz:
