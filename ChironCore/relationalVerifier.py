@@ -1,8 +1,8 @@
 """
 Relational Verifier for Non-Interference.
 
-Tier 1: straight-line programs  -> check_non_interference()
-Tier 2: single loop, no conditionals in body -> check_loop_non_interference()
+Tier 1: straight-line / conditional programs -> check_non_interference()
+Tier 2: single loop (body may contain conditionals) -> check_loop_non_interference()
 
 Turtle extension:
   When turtle_x or turtle_y appears in low_outputs, the verifier runs two checks:
@@ -110,15 +110,62 @@ def init_context(params, suffix):
 def encode_stmts(ctx, stmts):
     """
     Walk a list of IR (stmt, tgt) tuples and update ctx symbolically.
-    Handles AssignmentCommand and MoveCommand; silently skips everything else.
+    Handles AssignmentCommand, MoveCommand, and ConditionCommand (if/if-else).
+
+    Conditional IR layout (built by builder.py):
+      if-else: [cond, tgt=len(then)+2] then... [BoolFalse, tgt2=len(else)+1] else...
+      if-only: [cond, tgt=len(then)+1] then...
+    Both branches are symbolically executed and merged with Z3 If.
     """
-    for stmt, tgt in stmts:
+    i = 0
+    while i < len(stmts):
+        stmt, tgt = stmts[i]
         if isinstance(stmt, ChironAST.AssignmentCommand):
             handleAssignment(ctx, stmt)
+            i += 1
         elif isinstance(stmt, ChironAST.MoveCommand):
             handle_move(ctx, stmt)
+            i += 1
         elif isinstance(stmt, ChironAST.ConditionCommand):
-            pass  # handled at loop level
+            # Skip loop backedges (negative tgt) and unconditional jumps (BoolFalse)
+            if tgt <= 0 or str(stmt) == 'False':
+                i += 1
+                continue
+
+            # Check for if-else vs if-only by looking for BoolFalse jump
+            jump_idx = i + tgt - 1
+            is_if_else = (jump_idx < len(stmts) and
+                          isinstance(stmts[jump_idx][0], ChironAST.ConditionCommand) and
+                          str(stmts[jump_idx][0]) == 'False' and
+                          stmts[jump_idx][1] > 0)
+
+            cond_z3 = encode_condition(ctx, stmt)
+
+            if is_if_else:
+                then_stmts = stmts[i + 1 : jump_idx]
+                tgt2 = stmts[jump_idx][1]
+                else_stmts = stmts[i + tgt : i + tgt + tgt2 - 1]
+
+                ctx_then = _copy_ctx(ctx)
+                encode_stmts(ctx_then, then_stmts)
+
+                ctx_else = _copy_ctx(ctx)
+                encode_stmts(ctx_else, else_stmts)
+
+                _merge_contexts(ctx, cond_z3, ctx_then, ctx_else)
+                i = i + tgt + tgt2 - 1
+            else:
+                # if-only (no else branch)
+                then_stmts = stmts[i + 1 : i + tgt]
+
+                ctx_then = _copy_ctx(ctx)
+                encode_stmts(ctx_then, then_stmts)
+
+                ctx_else = _copy_ctx(ctx)  # unchanged original
+                _merge_contexts(ctx, cond_z3, ctx_then, ctx_else)
+                i = i + tgt
+        else:
+            i += 1
 
 
 def encode_condition(ctx, cond_stmt):
@@ -188,10 +235,8 @@ def _show_relational_state(model, inv_exprs, ctx1, ctx2):
     """Print expression values for both traces — relational invariant counterexample."""
     for expr_str in inv_exprs:
         e_str = expr_str.replace(":", "z3Vars.")
-        e1 = convertExp(ctx1, e_str)
-        e2 = convertExp(ctx2, e_str)
-        if isinstance(e1, (int, float)): e1 = IntVal(int(e1))
-        if isinstance(e2, (int, float)): e2 = IntVal(int(e2))
+        e1 = _z3_wrap(convertExp(ctx1, e_str))
+        e2 = _z3_wrap(convertExp(ctx2, e_str))
         v1 = model.eval(e1, model_completion=True)
         v2 = model.eval(e2, model_completion=True)
         tag = " <-- DIFFERS" if str(v1) != str(v2) else ""
@@ -399,7 +444,11 @@ def check_loop_non_interference(irHandler, params, low_inputs, low_outputs, inv_
 
     def _build_inv(c1, c2):
         if inv_exprs is not None:
-            return build_relational_invariant(c1, c2, inv_exprs)
+            rel = build_relational_invariant(c1, c2, inv_exprs)
+            # Low inputs are always equal — include even if not in .inv file
+            low_eq = [getattr(c1, v.replace(":", "")) == getattr(c2, v.replace(":", ""))
+                      for v in low_inputs]
+            return And(rel, *low_eq) if low_eq else rel
         return build_invariant(c1, c2, inv_vars)
 
     def _show_inv(m, c1, c2):
@@ -439,6 +488,7 @@ def check_loop_non_interference(irHandler, params, low_inputs, low_outputs, inv_
         m = s1.model()
         print("    Counterexample — loop entry state where INV is violated:")
         _show_inv(m, ctx1_entry, ctx2_entry)
+        _show_high_inputs(m, params, low_inputs, ctx1_entry, ctx2_entry)
 
     # ------------------------------------------------------------------
     # Check 2: Preservation (position invariant)
@@ -473,6 +523,7 @@ def check_loop_non_interference(irHandler, params, low_inputs, low_outputs, inv_
     if r2 == sat:
         m = s2.model()
         print("    Counterexample — one iteration that breaks INV:")
+        _show_high_inputs(m, params, low_inputs, ctx1_h, ctx2_h)
         print("    Before body (loop head):")
         _show_inv(m, ctx1_h, ctx2_h)
         print("    After body:")
@@ -537,6 +588,7 @@ def check_loop_non_interference(irHandler, params, low_inputs, low_outputs, inv_
     if r3 == sat:
         m = s3.model()
         print("    Counterexample — exit state where outputs diverge:")
+        _show_high_inputs(m, params, low_inputs, ctx1_e, ctx2_e)
         print("    At loop exit (INV holds here):")
         _show_inv(m, ctx1_e, ctx2_e)
         if post_loop_ir:
@@ -657,13 +709,57 @@ def _copy_missing_vars(src_ctx, dst_ctx, suffix):
             setAttr(dst_ctx, attr, Int(attr + suffix))
 
 
+def _merge_contexts(ctx, cond_z3, ctx_then, ctx_else):
+    """
+    Merge two branch contexts back into ctx using Z3 If on the condition.
+    For each variable: ctx.v = If(cond, ctx_then.v, ctx_else.v).
+    Variables unchanged in both branches keep their original value.
+    """
+    all_attrs = set(vars(ctx_then).keys()) | set(vars(ctx_else).keys())
+    for v in all_attrs:
+        then_val = getattr(ctx_then, v, None)
+        else_val = getattr(ctx_else, v, None)
+        if then_val is None and else_val is None:
+            continue
+        if then_val is None:
+            setAttr(ctx, v, else_val)
+        elif else_val is None:
+            setAttr(ctx, v, then_val)
+        elif then_val is else_val:
+            # Same object — neither branch modified it
+            setAttr(ctx, v, then_val)
+        else:
+            setAttr(ctx, v, If(cond_z3, then_val, else_val))
+
+
+def _z3_wrap(val):
+    """Ensure val is a Z3 expression — wrap plain Python ints/floats in IntVal."""
+    if isinstance(val, (int, float)):
+        return IntVal(int(val))
+    return val
+
+
+def _show_high_inputs(model, params, low_inputs, ctx1, ctx2):
+    """Show the secret (high) input values that Z3 chose to cause the leak."""
+    low_set = {v.replace(":", "") for v in low_inputs}
+    high_vars = [k.replace(":", "") for k in params if k.replace(":", "") not in low_set]
+    if not high_vars:
+        return
+    print("    Secret inputs (high):")
+    for v in high_vars:
+        v1 = model.eval(_z3_wrap(getattr(ctx1, v, IntVal(0))), model_completion=True)
+        v2 = model.eval(_z3_wrap(getattr(ctx2, v, IntVal(0))), model_completion=True)
+        tag = " <-- DIFFERS" if str(v1) != str(v2) else ""
+        print(f"      {v}: trace1={v1}, trace2={v2}{tag}")
+
+
 def _show_state(model, var_names, ctx1, ctx2):
     """
     Print concrete values of var_names in both traces evaluated against model.
     """
     for v in var_names:
-        val1 = model.eval(getattr(ctx1, v), model_completion=True)
-        val2 = model.eval(getattr(ctx2, v), model_completion=True)
+        val1 = model.eval(_z3_wrap(getattr(ctx1, v)), model_completion=True)
+        val2 = model.eval(_z3_wrap(getattr(ctx2, v)), model_completion=True)
         tag = " <-- DIFFERS" if str(val1) != str(val2) else ""
         print(f"      {v}: trace1={val1}, trace2={val2}{tag}")
 
@@ -755,8 +851,8 @@ def _report(result, solver, params, low_outputs, ctx1, ctx2):
         all_display = list(params.keys()) + [v for v in low_outputs if v not in params]
         for var in all_display:
             v = var.replace(":", "")
-            val1 = m.eval(getattr(ctx1, v))
-            val2 = m.eval(getattr(ctx2, v))
+            val1 = m.eval(_z3_wrap(getattr(ctx1, v)), model_completion=True)
+            val2 = m.eval(_z3_wrap(getattr(ctx2, v)), model_completion=True)
             tag = " <-- LEAK" if var in low_outputs and str(val1) != str(val2) else ""
             print(f"    {var}: trace1={val1}, trace2={val2}{tag}")
         print()
