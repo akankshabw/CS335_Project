@@ -74,6 +74,14 @@ class PauseCommand(Instruction):
     def __str__(self):
         return "pause"
 
+
+class InvariantAnnotation(Instruction):
+    def __init__(self, expr):
+        self.expr = expr
+
+    def __str__(self):
+        return "@@inv(" + self.expr.__str__() + ")"
+
 class Expression(AST):
     pass
 

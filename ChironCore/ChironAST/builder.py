@@ -172,3 +172,7 @@ class astGenPass(tlangVisitor):
 
     def visitPenCommand(self, ctx:tlangParser.PenCommandContext):
         return [(ChironAST.PenCommand(ctx.getText()), 1)]
+
+    def visitAnnotation(self, ctx:tlangParser.AnnotationContext):
+        expr = self.visit(ctx.expression())
+        return [(ChironAST.InvariantAnnotation(expr), 0)]

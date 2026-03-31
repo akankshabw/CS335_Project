@@ -31,6 +31,28 @@ def _is_turtle_check(low_outputs):
     return bool(lows & {"turtle_x", "turtle_y"})
 
 
+def _check_axis_aligned(ir):
+    """
+    Warn if any turn command uses a literal amount that is not a multiple of 90.
+    Our symbolic turtle model is only sound for axis-aligned programs (headings
+    restricted to {0, 90, 180, 270}).  Non-axis turns (e.g. left 72) would leave
+    x/y unchanged in our encoding, silently producing wrong results.
+
+    Returns True if safe to proceed, False if a non-axis literal turn is found.
+    """
+    for stmt, _ in ir:
+        if isinstance(stmt, ChironAST.MoveCommand) and stmt.direction in ("left", "right"):
+            expr = stmt.expr
+            if isinstance(expr, ChironAST.Num):
+                amt = int(expr.val)
+                if amt % 90 != 0:
+                    print(f"\n  [WARNING] Non-axis turn detected: {stmt.direction} {amt}")
+                    print("  The turtle model is only sound for turns that are multiples of 90.")
+                    print("  Turtle verification results for this program are UNSOUND.\n")
+                    exit(1)
+    return True
+
+
 def _init_turtle(ctx):
     """
     Lazily initialise turtle geometric state to origin (0,0) heading East (0 deg).
@@ -44,9 +66,9 @@ def _init_turtle(ctx):
 
 
 def _count_turtle_steps(ctx):
-    """Return the number of turtle_step_N attributes already on ctx."""
+    """Return the number of turtle move steps already recorded on ctx."""
     n = 0
-    while hasattr(ctx, f'turtle_step_{n}'):
+    while hasattr(ctx, f'turtle_step_{n}_dx'):
         n += 1
     return n
 
@@ -70,24 +92,35 @@ def handle_move(ctx, stmt):
     if isinstance(amt, (int, float)):
         amt = IntVal(int(amt))
 
-    # Record step amount (path-safety check uses this later)
-    idx = _count_turtle_steps(ctx)
-    setattr(ctx, f'turtle_step_{idx}', amt)
-
     # Normalised heading guaranteed in [0, 359]
     h = (ctx.turtle_h % 360 + 360) % 360
     x, y = ctx.turtle_x, ctx.turtle_y
 
     if stmt.direction == "forward":
-        ctx.turtle_x = If(h == 0,   x + amt, If(h == 180, x - amt, x))
-        ctx.turtle_y = If(h == 90,  y + amt, If(h == 270, y - amt, y))
+        dx = If(h == 0,   amt, If(h == 180, -amt, IntVal(0)))
+        dy = If(h == 90,  amt, If(h == 270, -amt, IntVal(0)))
+        ctx.turtle_x = x + dx
+        ctx.turtle_y = y + dy
     elif stmt.direction == "backward":
-        ctx.turtle_x = If(h == 0,   x - amt, If(h == 180, x + amt, x))
-        ctx.turtle_y = If(h == 90,  y - amt, If(h == 270, y + amt, y))
+        dx = If(h == 0,  -amt, If(h == 180,  amt, IntVal(0)))
+        dy = If(h == 90, -amt, If(h == 270,  amt, IntVal(0)))
+        ctx.turtle_x = x + dx
+        ctx.turtle_y = y + dy
     elif stmt.direction == "right":
         ctx.turtle_h = ctx.turtle_h - amt
+        dx, dy = IntVal(0), IntVal(0)
     elif stmt.direction == "left":
         ctx.turtle_h = ctx.turtle_h + amt
+        dx, dy = IntVal(0), IntVal(0)
+    else:
+        dx, dy = IntVal(0), IntVal(0)
+
+    # Record displacement vector (dx, dy) for path-safety checks.
+    # Comparing only the scalar amount would miss cases where same amount
+    # but different heading produces a different drawn segment.
+    idx = _count_turtle_steps(ctx)
+    setattr(ctx, f'turtle_step_{idx}_dx', dx)
+    setattr(ctx, f'turtle_step_{idx}_dy', dy)
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +159,8 @@ def encode_stmts(ctx, stmts):
         elif isinstance(stmt, ChironAST.MoveCommand):
             handle_move(ctx, stmt)
             i += 1
+        elif isinstance(stmt, ChironAST.InvariantAnnotation):
+            i += 1  # metadata — not executable
         elif isinstance(stmt, ChironAST.ConditionCommand):
             # Skip loop backedges (negative tgt) and unconditional jumps (BoolFalse)
             if tgt <= 0 or str(stmt) == 'False':
@@ -296,6 +331,8 @@ def check_non_interference(irHandler, params, low_inputs, low_outputs, progfl=No
     progfl: path to the .tl file (used to generate witness.sh on leak).
     """
     is_turtle = _is_turtle_check(low_outputs)
+    if is_turtle:
+        _check_axis_aligned(irHandler.ir)
 
     print("\n=== Relational Verifier (Tier 1: straight-line) ===")
     print(f"  Low inputs  : {low_inputs}")
@@ -352,8 +389,12 @@ def check_non_interference(irHandler, params, low_inputs, low_outputs, progfl=No
             s_path = Solver()
             s_path.add(*low_input_eq)
             step_diffs = [
-                getattr(ctx1, f'turtle_step_{i}') != getattr(ctx2, f'turtle_step_{i}')
+                clause
                 for i in range(n_steps)
+                for clause in [
+                    getattr(ctx1, f'turtle_step_{i}_dx') != getattr(ctx2, f'turtle_step_{i}_dx'),
+                    getattr(ctx1, f'turtle_step_{i}_dy') != getattr(ctx2, f'turtle_step_{i}_dy'),
+                ]
             ]
             s_path.add(Or(*step_diffs))
             r_path = s_path.check()
@@ -393,6 +434,8 @@ def check_loop_non_interference(irHandler, params, low_inputs, low_outputs, inv_
       3b. Path (post)     -- [turtle] post-loop step amounts equal given INV at exit  [turtle only]
     """
     is_turtle = _is_turtle_check(low_outputs)
+    if is_turtle:
+        _check_axis_aligned(irHandler.ir)
 
     print("\n=== Relational Verifier (Tier 2: loop) ===")
     print(f"  Low inputs  : {low_inputs}")
@@ -416,14 +459,41 @@ def check_loop_non_interference(irHandler, params, low_inputs, low_outputs, inv_
     print(f"  Loop exit    : IR[{exit_idx}]")
     print(f"  Post-loop    : IR[{exit_idx}:{len(irHandler.ir)}]  ({len(post_loop_ir)} statements)")
 
-    # Check for a relational invariant sidecar (.inv file)
-    inv_exprs = _parse_inv_file(progfl)  # list of expr strings, or None
+    # Check for relational invariant annotations:
+    #   Priority: 1. @@ annotations in IR  2. .inv sidecar  3. auto-generated
+    inv_exprs = None
+    inv_source = None
 
-    # Build invariant variable list (used when no sidecar, or to seed _fresh_ctx)
+    # 1. Scan IR for @@ InvariantAnnotation nodes
+    annotated = [str(stmt.expr) for stmt, _ in irHandler.ir
+                 if isinstance(stmt, ChironAST.InvariantAnnotation)]
+    if annotated:
+        inv_exprs = annotated
+        inv_source = "from @@ annotations in .tl"
+
+    # 2. Fall back to .inv sidecar file
+    if inv_exprs is None:
+        inv_exprs = _parse_inv_file(progfl)
+        if inv_exprs is not None:
+            inv_source = "from .inv sidecar"
+
+    # Auto-collect loop counters — always equal across traces
+    auto_counters = []
+    for stmt, _ in irHandler.ir:
+        if isinstance(stmt, ChironAST.AssignmentCommand):
+            v = str(stmt.lvar).replace(":", "")
+            if "__rep_counter_" in v and v not in auto_counters:
+                auto_counters.append(v)
+
+    # Build invariant variable list (used when no annotations/sidecar, or to seed _fresh_ctx)
     if inv_vars is None:
         if inv_exprs is not None:
             # Variables to create fresh Z3 vars for = all vars mentioned in expressions
+            # Plus loop counters and low inputs (always equal)
             inv_vars = _extract_inv_vars(inv_exprs)
+            for v in auto_counters:
+                if v not in inv_vars:
+                    inv_vars.append(v)
             for v in [v.replace(":", "") for v in low_inputs]:
                 if v not in inv_vars:
                     inv_vars.append(v)
@@ -438,17 +508,18 @@ def check_loop_non_interference(irHandler, params, low_inputs, low_outputs, inv_
                 inv_vars.append('turtle_h')
 
     if inv_exprs is not None:
-        print(f"  Invariant    : relational expressions {inv_exprs}  (from .inv sidecar)")
+        print(f"  Invariant    : relational expressions {inv_exprs}  ({inv_source})")
     else:
         print(f"  Invariant    : equal across traces for {inv_vars}")
 
     def _build_inv(c1, c2):
         if inv_exprs is not None:
             rel = build_relational_invariant(c1, c2, inv_exprs)
-            # Low inputs are always equal — include even if not in .inv file
-            low_eq = [getattr(c1, v.replace(":", "")) == getattr(c2, v.replace(":", ""))
-                      for v in low_inputs]
-            return And(rel, *low_eq) if low_eq else rel
+            # Low inputs and loop counters are always equal across traces
+            auto_eq = [getattr(c1, v.replace(":", "")) == getattr(c2, v.replace(":", ""))
+                       for v in low_inputs]
+            auto_eq += [getattr(c1, v) == getattr(c2, v) for v in auto_counters]
+            return And(rel, *auto_eq) if auto_eq else rel
         return build_invariant(c1, c2, inv_vars)
 
     def _show_inv(m, c1, c2):
@@ -536,11 +607,13 @@ def check_loop_non_interference(irHandler, params, low_inputs, low_outputs, inv_
     s2_path = None
     if is_turtle and n_body_steps > 0:
         print(f"\n  --- Check 2b: Path Safety in Body ({n_body_steps} step(s) per iteration) ---")
-        body_step_diffs = [
-            getattr(ctx1_post, f'turtle_step_{pre_body_steps + i}') !=
-            getattr(ctx2_post, f'turtle_step_{pre_body_steps + i}')
-            for i in range(n_body_steps)
-        ]
+        body_step_diffs = []
+        for i in range(n_body_steps):
+            idx = pre_body_steps + i
+            body_step_diffs.append(
+                getattr(ctx1_post, f'turtle_step_{idx}_dx') != getattr(ctx2_post, f'turtle_step_{idx}_dx'))
+            body_step_diffs.append(
+                getattr(ctx1_post, f'turtle_step_{idx}_dy') != getattr(ctx2_post, f'turtle_step_{idx}_dy'))
         s2_path = Solver()
         s2_path.add(_build_inv(ctx1_h, ctx2_h))
         s2_path.add(encode_condition(ctx1_h, loop_cond))
@@ -602,11 +675,13 @@ def check_loop_non_interference(irHandler, params, low_inputs, low_outputs, inv_
     s3_path = None
     if is_turtle and n_post_steps > 0:
         print(f"\n  --- Check 3b: Path Safety in Post-loop ({n_post_steps} step(s)) ---")
-        post_step_diffs = [
-            getattr(ctx1_final, f'turtle_step_{pre_post_steps + i}') !=
-            getattr(ctx2_final, f'turtle_step_{pre_post_steps + i}')
-            for i in range(n_post_steps)
-        ]
+        post_step_diffs = []
+        for i in range(n_post_steps):
+            idx = pre_post_steps + i
+            post_step_diffs.append(
+                getattr(ctx1_final, f'turtle_step_{idx}_dx') != getattr(ctx2_final, f'turtle_step_{idx}_dx'))
+            post_step_diffs.append(
+                getattr(ctx1_final, f'turtle_step_{idx}_dy') != getattr(ctx2_final, f'turtle_step_{idx}_dy'))
         s3_path = Solver()
         s3_path.add(_build_inv(ctx1_e, ctx2_e))
         s3_path.add(Not(encode_condition(ctx1_e, loop_cond)))
@@ -862,17 +937,19 @@ def _report(result, solver, params, low_outputs, ctx1, ctx2):
 
 
 def _report_path(result, solver, n_steps, ctx1, ctx2, step_offset=0):
-    """Report path-safety check result with per-step counterexample."""
+    """Report path-safety check result with per-step (dx, dy) counterexample."""
     if result == unsat:
-        print(f"  [PASS] Path safety: all {n_steps} move-step amount(s) equal across traces.")
+        print(f"  [PASS] Path safety: all {n_steps} move-step displacement(s) equal across traces.")
     elif result == sat:
         m = solver.model()
-        print(f"  [FAIL] Path leak — move-step amounts can differ across traces:")
+        print(f"  [FAIL] Path leak — move-step displacements can differ across traces:")
         for i in range(n_steps):
-            attr = f'turtle_step_{step_offset + i}'
-            v1 = m.eval(getattr(ctx1, attr), model_completion=True)
-            v2 = m.eval(getattr(ctx2, attr), model_completion=True)
-            tag = " <-- LEAK" if str(v1) != str(v2) else ""
-            print(f"    step {i}: trace1={v1},  trace2={v2}{tag}")
+            idx = step_offset + i
+            dx1 = m.eval(_z3_wrap(getattr(ctx1, f'turtle_step_{idx}_dx')), model_completion=True)
+            dy1 = m.eval(_z3_wrap(getattr(ctx1, f'turtle_step_{idx}_dy')), model_completion=True)
+            dx2 = m.eval(_z3_wrap(getattr(ctx2, f'turtle_step_{idx}_dx')), model_completion=True)
+            dy2 = m.eval(_z3_wrap(getattr(ctx2, f'turtle_step_{idx}_dy')), model_completion=True)
+            tag = " <-- LEAK" if (str(dx1) != str(dx2) or str(dy1) != str(dy2)) else ""
+            print(f"    step {i}: trace1=(dx={dx1}, dy={dy1})  trace2=(dx={dx2}, dy={dy2}){tag}")
     else:
         print("  [?] Path check returned UNKNOWN")

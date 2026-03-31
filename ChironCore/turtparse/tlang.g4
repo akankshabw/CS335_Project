@@ -17,7 +17,10 @@ instruction : assignment
 	    | penCommand
 	    | gotoCommand
 	    | pauseCommand
+	    | annotation
 	    ;
+
+annotation : '@@' expression ;
 
 conditional : ifConditional | ifElseConditional ;
 
