@@ -588,12 +588,15 @@ def check_loop_non_interference(irHandler, params, low_inputs, low_outputs, inv_
     if inv_vars is None:
         if inv_exprs is not None:
             # Variables to create fresh Z3 vars for = all vars mentioned in expressions
-            # Plus loop counters and low inputs (always equal)
+            # Plus loop counters, low inputs, and low outputs (always equal across traces)
             inv_vars = _extract_inv_vars(inv_exprs)
             for v in auto_counters:
                 if v not in inv_vars:
                     inv_vars.append(v)
             for v in [v.replace(":", "") for v in low_inputs]:
+                if v not in inv_vars:
+                    inv_vars.append(v)
+            for v in [v.replace(":", "") for v in low_outputs]:
                 if v not in inv_vars:
                     inv_vars.append(v)
         else:
@@ -618,6 +621,11 @@ def check_loop_non_interference(irHandler, params, low_inputs, low_outputs, inv_
             auto_eq = [getattr(c1, v.replace(":", "")) == getattr(c2, v.replace(":", ""))
                        for v in low_inputs]
             auto_eq += [getattr(c1, v) == getattr(c2, v) for v in auto_counters]
+            # Low outputs not already covered by inv_exprs are always equal too
+            inv_expr_vars = set(_extract_inv_vars(inv_exprs))
+            for v in [v.replace(":", "") for v in low_outputs]:
+                if v not in inv_expr_vars:
+                    auto_eq.append(getattr(c1, v) == getattr(c2, v))
             return And(rel, *auto_eq) if auto_eq else rel
         return build_invariant(c1, c2, inv_vars)
 
