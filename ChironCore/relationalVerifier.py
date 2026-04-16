@@ -315,6 +315,76 @@ def find_loop(ir):
     return None
 
 
+def _vars_in_expr(expr):
+    """
+    Recursively collect all Var names (without ':') from a ChironAST expression.
+    e.g. Sum(Var(':n'), Num(1))  ->  {'n'}
+    """
+    if isinstance(expr, ChironAST.Var):
+        return {str(expr).replace(":", "")}
+    result = set()
+    for attr in vars(expr).values():
+        if isinstance(attr, (ChironAST.Var,)) or hasattr(attr, '__dict__'):
+            result |= _vars_in_expr(attr)
+    return result
+
+
+def _get_loop_bound_expr(ir, head_idx):
+    """
+    Return the RHS expression that sets the loop counter, i.e. the bound.
+
+    builder.py emits:
+      [head_idx-1]  :__rep_counter_N = <bound_expr>   (init)
+      [head_idx]    ConditionCommand(counter > 0)      (loop head)
+
+    Returns a ChironAST expression node, or None if not found.
+    """
+    if head_idx == 0:
+        return None
+    init_stmt, _ = ir[head_idx - 1]
+    if isinstance(init_stmt, ChironAST.AssignmentCommand):
+        lvar = str(init_stmt.lvar).replace(":", "")
+        if "__rep_counter_" in lvar:
+            return init_stmt.rexpr
+    return None
+
+
+def _check_secret_bound(ir, head_idx, params, low_inputs):
+    """
+    Detect whether the loop bound expression depends on any high (secret) variable.
+
+    Returns (is_tainted, bound_expr_str, tainted_vars) where:
+      is_tainted    -- True if bound uses at least one secret variable
+      bound_expr_str -- string representation of the bound expression
+      tainted_vars  -- set of secret variable names found in the bound
+    """
+    low_set = {v.replace(":", "") for v in low_inputs}
+    high_set = {k.replace(":", "") for k in params if k.replace(":", "") not in low_set}
+
+    bound_expr = _get_loop_bound_expr(ir, head_idx)
+    if bound_expr is None:
+        return False, "?", set()
+
+    bound_vars = _vars_in_expr(bound_expr)
+    tainted = bound_vars & high_set
+    return bool(tainted), str(bound_expr), tainted
+
+
+def _body_writes_low_output(body_ir, low_outputs):
+    """
+    Return True if any assignment in the loop body writes to a low output variable.
+    This distinguishes a pure timing side-channel (body never touches low outputs)
+    from a value leak where the secret bound also causes a direct output divergence.
+    """
+    low_set = {v.replace(":", "") for v in low_outputs}
+    for stmt, _ in body_ir:
+        if isinstance(stmt, ChironAST.AssignmentCommand):
+            lvar = str(stmt.lvar).replace(":", "")
+            if lvar in low_set:
+                return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Tier 1: straight-line
 # ---------------------------------------------------------------------------
@@ -458,6 +528,35 @@ def check_loop_non_interference(irHandler, params, low_inputs, low_outputs, inv_
     print(f"  Body         : IR[{body_start}:{body_end}]")
     print(f"  Loop exit    : IR[{exit_idx}]")
     print(f"  Post-loop    : IR[{exit_idx}:{len(irHandler.ir)}]  ({len(post_loop_ir)} statements)")
+
+    # ------------------------------------------------------------------
+    # Timing side-channel: secret-dependent loop bound
+    # ------------------------------------------------------------------
+    is_tainted, bound_str, tainted_vars = _check_secret_bound(
+        irHandler.ir, head_idx, params, low_inputs
+    )
+    if is_tainted:
+        body_ir = irHandler.ir[body_start:body_end]
+        touches_low = _body_writes_low_output(body_ir, low_outputs)
+        if touches_low:
+            # Body writes a low output, so the secret bound causes a direct value
+            # leak too (different iteration counts -> different output values).
+            # Fall through to the standard 3-check machinery so the full
+            # counterexample is reported — but warn about the bound first.
+            print(f"\n  [!] WARNING: Loop bound '{bound_str}' depends on secret variable(s): {tainted_vars}")
+            print(f"  The body also writes a low output — this is a VALUE LEAK, not just a timing leak.")
+            print(f"  Continuing with standard invariant checks to produce a full counterexample...\n")
+        else:
+            # Body never touches any low output, so the only observable difference
+            # between two runs with different secrets is the number of iterations.
+            print(f"\n  [!] TIMING SIDE-CHANNEL DETECTED")
+            print(f"  The loop bound '{bound_str}' depends on secret variable(s): {tainted_vars}")
+            print(f"  The loop body does NOT write any low output, so there is no direct value leak.")
+            print(f"  However, an observer can infer the secret by counting loop iterations")
+            print(f"  (e.g. via execution time, energy consumption, or cache behaviour).")
+            print(f"\n  NON-INTERFERENCE: FAILS (pure timing / termination side-channel)")
+            print("===========================================\n")
+            return "sat"
 
     # Check for relational invariant annotations:
     #   Priority: 1. @@ annotations in IR  2. .inv sidecar  3. auto-generated
