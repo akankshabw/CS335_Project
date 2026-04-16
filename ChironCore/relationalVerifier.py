@@ -294,7 +294,7 @@ def build_invariant(ctx1, ctx2, inv_var_names):
 
 def find_loop(ir):
     """
-    Scan the IR for a single repeat-loop structure.
+    Scan the IR for the first repeat-loop structure.
 
     A Chiron loop looks like:
       [head_idx]   ConditionCommand(counter != 0)   tgt > 0
@@ -313,6 +313,99 @@ def find_loop(ir):
                 if isinstance(back_stmt, ChironAST.ConditionCommand) and back_tgt < 0:
                     return (i, i + 1, back_idx, i + tgt)
     return None
+
+
+def find_all_loops(ir):
+    """
+    Return a list of all sequential (non-nested) repeat-loop structures in ir,
+    each as (head_idx, body_start, body_end, exit_idx), in program order.
+
+    Nested loops are not supported — if a loop body itself contains a loop head
+    the inner loop is skipped (the outer loop's exit_idx jumps past it).
+    """
+    loops = []
+    i = 0
+    while i < len(ir):
+        stmt, tgt = ir[i]
+        if isinstance(stmt, ChironAST.ConditionCommand) and tgt > 0:
+            back_idx = i + tgt - 1
+            if back_idx < len(ir):
+                back_stmt, back_tgt = ir[back_idx]
+                if isinstance(back_stmt, ChironAST.ConditionCommand) and back_tgt < 0:
+                    exit_idx = i + tgt
+                    loops.append((i, i + 1, back_idx, exit_idx))
+                    i = exit_idx   # skip past this loop entirely
+                    continue
+        i += 1
+    return loops
+
+
+def _annotations_for_loop(ir, head_idx):
+    """
+    Collect @@ InvariantAnnotation nodes that belong to a specific loop.
+
+    builder.py places annotations immediately before the loop's counter-init
+    assignment (which is at head_idx - 1).  We scan backward from head_idx - 1
+    collecting consecutive InvariantAnnotation nodes, stopping at the first
+    non-annotation instruction or the previous loop's exit.
+
+    Returns a list of expression strings (colon-prefixed, e.g. ':acc1'), or [].
+    """
+    exprs = []
+    # Walk backward from the counter-init slot
+    j = head_idx - 2   # head_idx-1 is the counter init; annotations sit before it
+    while j >= 0:
+        stmt, _ = ir[j]
+        if isinstance(stmt, ChironAST.InvariantAnnotation):
+            exprs.append(str(stmt.expr))
+            j -= 1
+        else:
+            break
+    exprs.reverse()   # restore program order
+    return exprs
+
+
+def _parse_inv_file_multi(progfl):
+    """
+    Parse a multi-loop .inv sidecar file.
+
+    Convention: invariant expressions for each loop are separated by a blank line.
+    Lines starting with '#' are comments and are ignored.
+
+    Example for a 2-loop program:
+        # loop 1
+        :out1
+        :temp - :secret
+
+        # loop 2
+        :out2
+
+    Returns a list of groups: [ [expr, ...], [expr, ...], ... ]
+    Each group corresponds to one loop (by position).  Missing groups (file has
+    fewer groups than loops) will fall back to auto-generated invariants.
+    Returns None if no sidecar file exists.
+    """
+    if not progfl:
+        return None
+    inv_path = progfl.replace(".tl", ".inv")
+    if not os.path.exists(inv_path):
+        return None
+
+    groups = []
+    current = []
+    with open(inv_path) as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                if current:
+                    groups.append(current)
+                    current = []
+            else:
+                current.append(stripped)
+    if current:
+        groups.append(current)
+
+    return groups if groups else None
 
 
 def _vars_in_expr(expr):
@@ -383,6 +476,317 @@ def _body_writes_low_output(body_ir, low_outputs):
             if lvar in low_set:
                 return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Tier 2b: multiple sequential loops
+# ---------------------------------------------------------------------------
+
+def _verify_one_loop(loop_idx, loop, full_ir, ctx1_entry, ctx2_entry,
+                     params, low_inputs, low_outputs,
+                     inv_exprs, inv_source, is_turtle,
+                     entry_assumptions=None):
+    """
+    Run the three-check inductive proof for one loop.
+
+    ctx1_entry / ctx2_entry  -- the REAL concrete symbolic state at loop entry,
+                                 built by encoding all preceding code linearly.
+                                 Used directly for Check 1 (no fresh vars needed).
+    inv_exprs                -- list of relational expression strings, or None
+                                 for auto-generated equality invariants.
+
+    Returns (r1, r2, r3, all_pass).
+    The caller is responsible for maintaining ctx1/ctx2 across loops.
+    """
+    head_idx, body_start, body_end, exit_idx = loop
+    body_ir   = full_ir[body_start:body_end]
+    loop_cond = full_ir[head_idx][0]
+
+    label = f"Loop {loop_idx + 1}"
+    print(f"\n  {'='*10} {label} {'='*10}")
+    print(f"  Loop head : IR[{head_idx}]  condition: {loop_cond}")
+    print(f"  Body      : IR[{body_start}:{body_end}]")
+    print(f"  Exit      : IR[{exit_idx}]")
+
+    # Collect counter var for this loop only
+    auto_counters = []
+    for stmt, _ in full_ir[head_idx - 1:exit_idx]:
+        if isinstance(stmt, ChironAST.AssignmentCommand):
+            v = str(stmt.lvar).replace(":", "")
+            if "__rep_counter_" in v and v not in auto_counters:
+                auto_counters.append(v)
+
+    # Build inv_vars list (for fresh ctx in Check 2 / Check 3)
+    if inv_exprs is not None:
+        inv_vars = _extract_inv_vars(inv_exprs)
+        for v in auto_counters:
+            if v not in inv_vars: inv_vars.append(v)
+        for v in [x.replace(":", "") for x in low_inputs]:
+            if v not in inv_vars: inv_vars.append(v)
+        for v in [x.replace(":", "") for x in low_outputs]:
+            if v not in inv_vars: inv_vars.append(v)
+        print(f"  Invariant : relational expressions {inv_exprs}  ({inv_source})")
+    else:
+        inv_vars = [v.replace(":", "") for v in low_inputs + low_outputs]
+        for v in auto_counters:
+            if v not in inv_vars: inv_vars.append(v)
+        if is_turtle and 'turtle_h' not in inv_vars:
+            inv_vars.append('turtle_h')
+        print(f"  Invariant : equal across traces for {inv_vars}  (auto-generated)")
+
+    def _build_inv(c1, c2):
+        if inv_exprs is not None:
+            rel = build_relational_invariant(c1, c2, inv_exprs)
+            auto_eq = [getattr(c1, v.replace(":", "")) == getattr(c2, v.replace(":", ""))
+                       for v in low_inputs]
+            auto_eq += [getattr(c1, v) == getattr(c2, v) for v in auto_counters]
+            inv_expr_vars = set(_extract_inv_vars(inv_exprs))
+            for v in [x.replace(":", "") for x in low_outputs]:
+                if v not in inv_expr_vars:
+                    auto_eq.append(getattr(c1, v) == getattr(c2, v))
+            return And(rel, *auto_eq) if auto_eq else rel
+        return build_invariant(c1, c2, inv_vars)
+
+    def _show_inv(m, c1, c2):
+        if inv_exprs is not None:
+            _show_relational_state(m, inv_exprs, c1, c2)
+        else:
+            _show_state(m, inv_vars, c1, c2)
+
+    # Low-input equality on the real entry context
+    low_input_eq = [
+        getattr(ctx1_entry, v.replace(":", "")) == getattr(ctx2_entry, v.replace(":", ""))
+        for v in low_inputs
+    ]
+
+    # ------------------------------------------------------------------
+    # Check 1: Initialization — use the REAL symbolic entry state directly.
+    # ctx1_entry / ctx2_entry are concrete Z3 expressions, not fresh vars,
+    # so this faithfully reflects what the program state actually is.
+    # For loop k>1 we also add the previous loop's exit invariant (applied
+    # to the same ctx, which has been updated with between-loop code) so
+    # that Z3 knows what was proven true at the end of the previous loop.
+    # ------------------------------------------------------------------
+    print(f"\n  --- {label} Check 1: Initialization ---")
+    s1 = Solver()
+    s1.add(*low_input_eq)
+    if entry_assumptions:
+        s1.add(*entry_assumptions)
+    s1.add(Not(_build_inv(ctx1_entry, ctx2_entry)))
+    r1 = s1.check()
+    _print_check("Initialization", r1,
+                 "INV holds at loop entry",
+                 "INV does NOT hold at entry — check your invariant or pre-loop / between-loop code")
+    if r1 == sat:
+        m = s1.model()
+        print("    Counterexample — loop entry state where INV is violated:")
+        _show_inv(m, ctx1_entry, ctx2_entry)
+        _show_high_inputs(m, params, low_inputs, ctx1_entry, ctx2_entry)
+
+    # ------------------------------------------------------------------
+    # Check 2: Preservation (inductive step) — fresh symbolic vars
+    # ------------------------------------------------------------------
+    print(f"\n  --- {label} Check 2: Preservation ---")
+    ctx1_h = _fresh_ctx(inv_vars + [v.replace(":", "") for v in low_inputs], "_1h")
+    ctx2_h = _fresh_ctx(inv_vars + [v.replace(":", "") for v in low_inputs], "_2h")
+    _copy_missing_vars(ctx1_entry, ctx1_h, "_1h")
+    _copy_missing_vars(ctx2_entry, ctx2_h, "_2h")
+
+    ctx1_post = _copy_ctx(ctx1_h)
+    ctx2_post = _copy_ctx(ctx2_h)
+    encode_stmts(ctx1_post, body_ir)
+    encode_stmts(ctx2_post, body_ir)
+
+    s2 = Solver()
+    s2.add(_build_inv(ctx1_h, ctx2_h))
+    s2.add(encode_condition(ctx1_h, loop_cond))
+    s2.add(encode_condition(ctx2_h, loop_cond))
+    s2.add(Not(_build_inv(ctx1_post, ctx2_post)))
+    r2 = s2.check()
+    _print_check("Preservation", r2,
+                 "body preserves INV",
+                 "body BREAKS INV — loop leaks or invariant too weak")
+    if r2 == sat:
+        m = s2.model()
+        print("    Counterexample — one iteration that breaks INV:")
+        _show_high_inputs(m, params, low_inputs, ctx1_h, ctx2_h)
+        print("    Before body:")
+        _show_inv(m, ctx1_h, ctx2_h)
+        print("    After body:")
+        _show_inv(m, ctx1_post, ctx2_post)
+
+    # ------------------------------------------------------------------
+    # Check 3: Consequence — fresh symbolic exit vars
+    # ------------------------------------------------------------------
+    print(f"\n  --- {label} Check 3: Consequence ---")
+    ctx1_e = _fresh_ctx(inv_vars + [v.replace(":", "") for v in low_inputs + low_outputs], "_1e")
+    ctx2_e = _fresh_ctx(inv_vars + [v.replace(":", "") for v in low_inputs + low_outputs], "_2e")
+    _copy_missing_vars(ctx1_entry, ctx1_e, "_1e")
+    _copy_missing_vars(ctx2_entry, ctx2_e, "_2e")
+
+    diverge_at_exit = Or(*[
+        getattr(ctx1_e, v.replace(":", "")) != getattr(ctx2_e, v.replace(":", ""))
+        for v in low_outputs
+    ])
+    s3 = Solver()
+    s3.add(_build_inv(ctx1_e, ctx2_e))
+    s3.add(Not(encode_condition(ctx1_e, loop_cond)))
+    s3.add(Not(encode_condition(ctx2_e, loop_cond)))
+    s3.add(diverge_at_exit)
+    r3 = s3.check()
+    _print_check("Consequence", r3,
+                 "INV at exit implies non-interference on low outputs",
+                 "non-interference fails at exit — invariant too weak or loop leaks")
+    if r3 == sat:
+        m = s3.model()
+        print("    Counterexample — exit state where low outputs diverge:")
+        _show_high_inputs(m, params, low_inputs, ctx1_e, ctx2_e)
+        print("    At loop exit (INV holds here):")
+        _show_inv(m, ctx1_e, ctx2_e)
+
+    all_pass = (r1 == unsat) and (r2 == unsat) and (r3 == unsat)
+    return r1, r2, r3, _build_inv, loop_cond, all_pass
+
+
+def check_multi_loop_non_interference(irHandler, loops, params, low_inputs, low_outputs,
+                                      inv_groups, progfl=None):
+    """
+    Non-interference check for programs with multiple sequential (non-nested) loops.
+
+    Design: one real symbolic context (ctx1, ctx2) is encoded linearly through
+    the entire program — pre-loop code, between-loop code, counter inits, etc.
+    This means Check 1 for each loop sees the ACTUAL symbolic state, so any
+    secret-dependent computation in between-loop code is correctly reflected.
+
+    Check 2 (preservation) and Check 3 (consequence) use fresh symbolic vars
+    as in the single-loop case.
+
+    inv_groups: list of (inv_exprs, inv_source) per loop.
+    """
+    is_turtle = _is_turtle_check(low_outputs)
+
+    print("\n=== Relational Verifier (Tier 2b: multiple sequential loops) ===")
+    print(f"  Low inputs  : {low_inputs}")
+    print(f"  Low outputs : {low_outputs}")
+    print(f"  Loops found : {len(loops)}")
+
+    full_ir = irHandler.ir
+
+    # -- Start with a real symbolic context and encode everything before loop 1 --
+    ctx1 = init_context(params, "_1")
+    ctx2 = init_context(params, "_2")
+    if is_turtle:
+        _init_turtle(ctx1)
+        _init_turtle(ctx2)
+
+    first_head = loops[0][0]
+    pre_ir = full_ir[:first_head]
+    if pre_ir:
+        print(f"\n  [Pre-loop code] IR[0:{first_head}]")
+        encode_stmts(ctx1, pre_ir)
+        encode_stmts(ctx2, pre_ir)
+
+    all_safe = True
+    # Accumulated exit-invariant constraints from previous loops.
+    # These are added to Check 1 of the next loop so Z3 knows what was proven.
+    prev_exit_constraints = []
+    prev_loop_cond = None
+
+    for k, loop in enumerate(loops):
+        head_idx, body_start, body_end, exit_idx = loop
+
+        # -- Encode between-loop code on the real ctx --
+        if k > 0:
+            prev_exit = loops[k - 1][3]
+            between_ir = full_ir[prev_exit : head_idx - 1]  # up to but not incl. counter-init
+            if between_ir:
+                print(f"\n  [Between-loop code] IR[{prev_exit}:{head_idx - 1}]")
+                encode_stmts(ctx1, between_ir)
+                encode_stmts(ctx2, between_ir)
+
+        # -- Encode the counter-init on the real ctx --
+        encode_stmts(ctx1, full_ir[head_idx - 1 : head_idx])
+        encode_stmts(ctx2, full_ir[head_idx - 1 : head_idx])
+
+        inv_exprs, inv_source = inv_groups[k]
+
+        # Timing side-channel check
+        is_tainted, bound_str, tainted_vars = _check_secret_bound(
+            full_ir, head_idx, params, low_inputs
+        )
+        if is_tainted:
+            body_ir_k = full_ir[body_start:body_end]
+            if _body_writes_low_output(body_ir_k, low_outputs):
+                print(f"\n  [!] WARNING (Loop {k+1}): bound '{bound_str}' depends on secret {tainted_vars}")
+                print(f"  Body writes a low output — VALUE LEAK. Continuing with invariant checks...\n")
+            else:
+                print(f"\n  [!] TIMING SIDE-CHANNEL (Loop {k+1}): bound '{bound_str}' depends on secret {tainted_vars}")
+                print(f"  Body does not write any low output — pure timing/termination leak.")
+                print(f"\n  NON-INTERFERENCE: FAILS (timing side-channel in loop {k+1})")
+                print("=================================================================\n")
+                return "sat"
+
+        # -- Run the 3-check proof for this loop --
+        # ctx1/ctx2 are the real symbolic entry state — Check 1 uses them directly.
+        # prev_exit_constraints carries what was proven at the end of the previous loop.
+        r1, r2, r3, loop_build_inv, loop_cond, loop_safe = _verify_one_loop(
+            k, loop, full_ir, ctx1, ctx2,
+            params, low_inputs, low_outputs,
+            inv_exprs, inv_source, is_turtle,
+            entry_assumptions=prev_exit_constraints
+        )
+        if not loop_safe:
+            all_safe = False
+
+        # -- Build constraints for the next loop's Check 1 --
+        # We know: loop's INV holds at exit AND loop condition is false.
+        # These are expressed on the CURRENT ctx1/ctx2 (which will be updated
+        # with between-loop code before the next loop's Check 1 runs).
+        prev_exit_constraints = [
+            loop_build_inv(ctx1, ctx2),
+            Not(encode_condition(ctx1, loop_cond)),
+            Not(encode_condition(ctx2, loop_cond)),
+        ]
+
+    # -- Encode any post-last-loop straight-line code and do a final check --
+    last_exit = loops[-1][3]
+    post_ir = full_ir[last_exit:]
+    if post_ir:
+        print(f"\n  [Post-loop code] IR[{last_exit}:{len(full_ir)}]")
+        encode_stmts(ctx1, post_ir)
+        encode_stmts(ctx2, post_ir)
+
+    print(f"\n  --- Final output check (after all loops) ---")
+    low_input_eq = [
+        getattr(ctx1, v.replace(":", "")) == getattr(ctx2, v.replace(":", ""))
+        for v in low_inputs
+    ]
+    diverge_final = Or(*[
+        getattr(ctx1, v.replace(":", "")) != getattr(ctx2, v.replace(":", ""))
+        for v in low_outputs
+    ])
+    sf = Solver()
+    sf.add(*low_input_eq)
+    # Also assume the last loop's exit invariant holds
+    if prev_exit_constraints:
+        sf.add(*prev_exit_constraints)
+    sf.add(diverge_final)
+    rf = sf.check()
+    _print_check("Final outputs", rf,
+                 "low outputs agree after all loops and post-loop code",
+                 "low outputs can diverge — leak in post-loop code or invariants too weak")
+    if rf == sat:
+        m = sf.model()
+        _show_state(m, [v.replace(":", "") for v in low_outputs], ctx1, ctx2)
+        all_safe = False
+
+    print(f"\n  --- Overall ---")
+    if all_safe:
+        print("  NON-INTERFERENCE: HOLDS (all loops verified)")
+    else:
+        print("  NON-INTERFERENCE: FAILS (see failed checks above)")
+    print("=================================================================\n")
+    return "unsat" if all_safe else "sat"
 
 
 # ---------------------------------------------------------------------------
@@ -513,11 +917,32 @@ def check_loop_non_interference(irHandler, params, low_inputs, low_outputs, inv_
     if is_turtle:
         print("  Turtle mode : position + path checks on body and post-loop")
 
-    loop = find_loop(irHandler.ir)
-    if loop is None:
+    all_loops = find_all_loops(irHandler.ir)
+    if not all_loops:
         print("  [!] No loop found — falling back to Tier 1.")
         return check_non_interference(irHandler, params, low_inputs, low_outputs)
 
+    # --- Dispatch to multi-loop path when there is more than one loop ---
+    if len(all_loops) > 1:
+        # Build per-loop (inv_exprs, inv_source) pairs
+        inv_groups_multi = []
+        sidecar_groups = _parse_inv_file_multi(progfl)   # list of groups or None
+        for k, lp in enumerate(all_loops):
+            lp_head = lp[0]
+            ann = _annotations_for_loop(irHandler.ir, lp_head)
+            if ann:
+                inv_groups_multi.append((ann, f"from @@ annotations (loop {k+1})"))
+            elif sidecar_groups and k < len(sidecar_groups):
+                inv_groups_multi.append((sidecar_groups[k], f"from .inv sidecar (group {k+1})"))
+            else:
+                inv_groups_multi.append((None, "auto-generated"))
+        return check_multi_loop_non_interference(
+            irHandler, all_loops, params, low_inputs, low_outputs,
+            inv_groups_multi, progfl=progfl
+        )
+
+    # --- Single loop: use original Tier 2 path ---
+    loop = all_loops[0]
     head_idx, body_start, body_end, exit_idx = loop
     pre_loop_ir   = irHandler.ir[:head_idx]
     body_ir       = irHandler.ir[body_start:body_end]

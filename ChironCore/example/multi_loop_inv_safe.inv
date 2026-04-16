@@ -1,0 +1,6 @@
+# Loop 1: acc accumulates pub * iterations — stays equal across traces
+:acc
+
+# Loop 2: total accumulates acc * iterations — acc is already equal, so total stays equal
+:total
+:acc
