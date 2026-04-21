@@ -144,6 +144,22 @@ if __name__ == "__main__":
         type=ast.literal_eval,
         help='List of low (public) output variables, e.g. \'[":out"]\'',
     )
+    cmdparser.add_argument(
+        "--swap",
+        default=[],
+        type=ast.literal_eval,
+        help='Pair of input variables to swap between traces for symmetry checking, e.g. \'[":a", ":b"]\'',
+    )
+    cmdparser.add_argument(
+        "--sym",
+        default=[],
+        type=ast.literal_eval,
+        help=(
+            'Check symmetry-2 safety: outputs must not change when two inputs are swapped. '
+            'Auto-dispatches across all tiers (straight-line, single loop, multi-loop). '
+            'E.g. \'[":a", ":b"]\''
+        ),
+    )
 
     # TODO: add additional arguments for parsing command-line arguments
 
@@ -307,6 +323,39 @@ if __name__ == "__main__":
             irHandler,
             params=args.params,
             low_inputs=args.low_in,
+            low_outputs=args.low_out,
+            progfl=args.progfl,
+        )
+
+    if args.swap:
+        if not args.params:
+            raise RuntimeError(
+                "Symmetry checking needs all program variables listed. Use '-d'."
+            )
+        if len(args.swap) != 2:
+            raise RuntimeError(
+                "--swap requires exactly two variable names, e.g. '[\":a\", \":b\"]'"
+            )
+        rv.check_symmetry(
+            irHandler,
+            params=args.params,
+            swap=args.swap,
+            low_outputs=args.low_out,
+        )
+
+    if args.sym:
+        if not args.params:
+            raise RuntimeError(
+                "Symmetry-2 checking needs all program variables listed. Use '-d'."
+            )
+        if len(args.sym) != 2:
+            raise RuntimeError(
+                "--sym requires exactly two variable names, e.g. '[\":a\", \":b\"]'"
+            )
+        rv.check_symmetry_all_tiers(
+            irHandler,
+            params=args.params,
+            swap=args.sym,
             low_outputs=args.low_out,
             progfl=args.progfl,
         )
