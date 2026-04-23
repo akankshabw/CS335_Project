@@ -717,10 +717,10 @@ def check_multi_loop_non_interference(irHandler, loops, params, low_inputs, low_
         if is_tainted:
             body_ir_k = full_ir[body_start:body_end]
             if _body_writes_low_output(body_ir_k, low_outputs):
-                print(f"\n  [!] WARNING (Loop {k+1}): bound '{bound_str}' depends on secret {tainted_vars}")
+                print(f"\n  [!] WARNING (Loop {k+1}): bound '{bound_str}' is non low")
                 print(f"  Body writes a low output — VALUE LEAK. Continuing with invariant checks...\n")
             else:
-                print(f"\n  [!] TIMING SIDE-CHANNEL (Loop {k+1}): bound '{bound_str}' depends on secret {tainted_vars}")
+                print(f"\n  [!] TIMING SIDE-CHANNEL (Loop {k+1}): bound '{bound_str}' is non low")
                 print(f"  Body does not write any low output — pure timing/termination leak.")
                 print(f"\n  NON-INTERFERENCE: FAILS (timing side-channel in loop {k+1})")
                 print("=================================================================\n")
@@ -990,327 +990,223 @@ def check_symmetry(irHandler, params, swap, low_outputs):
 
 
 # ---------------------------------------------------------------------------
-# Symmetry-2: loop-aware dispatch
+# Generic relational 2-safety engine (shared by symmetry-2 and monotonicity)
 # ---------------------------------------------------------------------------
+#
+# A "property" is described by a PropSpec namedtuple:
+#
+#   input_constraints(ctx1, ctx2, params) -> [z3 expr]
+#       Constraints that relate the two traces' INPUTS.
+#       e.g. symmetry: a_1==b_2, b_1==a_2, others equal
+#            monotonicity: x_1 <= x_2, others equal
+#
+#   build_inv(c1, c2, inv_vars, inv_exprs, auto_counters, low_outputs) -> z3 expr
+#       Loop invariant.  Must be consistent with input_constraints so that
+#       Check 1 (Init) is satisfiable for correct programs.
+#
+#   divergence(ctx1, ctx2, low_outputs) -> z3 expr
+#       The "bad" post-condition whose absence we prove.
+#       e.g. symmetry: any output differs
+#            monotonicity: any output decreases (out_1 > out_2)
+#
+#   name        : short display name, e.g. "SYMMETRY-2"
+#   init_label  : Check-1 pass/fail messages
+#   cons_label  : Check-3 pass/fail messages
+#   final_label : overall pass/fail messages
 
-def check_symmetry_all_tiers(irHandler, params, swap, low_outputs, progfl=None):
-    """
-    Symmetry-2 safety property: swapping two inputs must not change the outputs.
-    Auto-dispatches to the appropriate tier based on loop structure:
-      Tier 1  -- no loops         -> check_symmetry (straight-line)
-      Tier 2  -- one loop         -> check_symmetry_loop
-      Tier 2b -- multiple loops   -> check_symmetry_multi_loop
-    """
-    if len(swap) != 2:
-        raise ValueError('--sym requires exactly two variable names, e.g. \'[":a", ":b"]\'')
+from collections import namedtuple
 
-    all_loops = find_all_loops(irHandler.ir)
-
-    if not all_loops:
-        print("  [Tier dispatch] No loops found — using Tier 1 (straight-line).")
-        return check_symmetry(irHandler, params, swap, low_outputs)
-    elif len(all_loops) == 1:
-        print("  [Tier dispatch] Single loop found — using Tier 2.")
-        return check_symmetry_loop(irHandler, params, swap, low_outputs, progfl=progfl)
-    else:
-        print(f"  [Tier dispatch] {len(all_loops)} loops found — using Tier 2b (multi-loop).")
-        inv_groups = []
-        sidecar_groups = _parse_inv_file_multi(progfl)
-        for k, lp in enumerate(all_loops):
-            ann = _annotations_for_loop(irHandler.ir, lp[0])
-            if ann:
-                inv_groups.append((ann, f"from @@ annotations (loop {k+1})"))
-            elif sidecar_groups and k < len(sidecar_groups):
-                inv_groups.append((sidecar_groups[k], f"from .inv sidecar (group {k+1})"))
-            else:
-                inv_groups.append((None, "auto-generated"))
-        return check_symmetry_multi_loop(irHandler, all_loops, params, swap, low_outputs, inv_groups, progfl=progfl)
-
-
-def _build_sym_inv(c1, c2, v0, v1, inv_vars, inv_exprs, auto_counters, low_outputs):
-    """
-    Build the loop invariant for symmetry-2 checks.
-
-    When no user annotation is given (inv_exprs is None), the auto-invariant for
-    non-interference uses simple equality for every variable.  For symmetry that
-    is wrong: the swapped pair (v0, v1) intentionally differ across traces, so
-    asserting v0_1 == v0_2 is unsatisfiable under the swap constraint and makes
-    Check 1 always fail.
-
-    The correct auto-invariant asserts:
-      - cross-equalities for the swapped pair:  c1.v0 == c2.v1  AND  c1.v1 == c2.v0
-      - simple equality for every other variable in inv_vars (counters, outputs, etc.)
-
-    When user annotations ARE present, we delegate to the expression-based builder
-    exactly as in non-interference (the user is responsible for writing a correct
-    relational invariant; they may include the swap relation explicitly).
-    """
-    if inv_exprs is not None:
-        rel = build_relational_invariant(c1, c2, inv_exprs)
-        auto_eq = [getattr(c1, v) == getattr(c2, v) for v in auto_counters]
-        inv_expr_vars = set(_extract_inv_vars(inv_exprs))
-        for v in [x.replace(":", "") for x in low_outputs]:
-            if v not in inv_expr_vars:
-                auto_eq.append(getattr(c1, v) == getattr(c2, v))
-        return And(rel, *auto_eq) if auto_eq else rel
-
-    clauses = []
-    # Cross-equalities for the swapped pair
-    clauses.append(getattr(c1, v0) == getattr(c2, v1))
-    clauses.append(getattr(c1, v1) == getattr(c2, v0))
-    # Simple equality for every other var in the invariant scope
-    for v in inv_vars:
-        if v not in (v0, v1):
-            clauses.append(getattr(c1, v) == getattr(c2, v))
-    return And(*clauses) if len(clauses) > 1 else clauses[0]
+PropSpec = namedtuple("PropSpec", [
+    "name",
+    "input_constraints",
+    "build_inv",
+    "divergence",
+    "init_pass_msg",
+    "init_fail_msg",
+    "cons_pass_msg",
+    "cons_fail_msg",
+    "overall_pass_msg",
+    "overall_fail_msg",
+    "inv_label",
+])
 
 
-def _build_swap_constraints(ctx1, ctx2, params, swap, low_outputs):
-    """
-    Build the symmetry-2 input constraints for Z3:
-      - Swapped pair: ctx1.v0 == ctx2.v1  AND  ctx1.v1 == ctx2.v0
-      - All other non-output inputs: ctx1.v == ctx2.v
-    Returns a list of Z3 constraints.
-    """
-    v0 = swap[0].replace(":", "")
-    v1 = swap[1].replace(":", "")
-    out_set = {v.replace(":", "") for v in low_outputs}
-
-    constraints = [
-        Int(v0 + "_1") == Int(v1 + "_2"),
-        Int(v1 + "_1") == Int(v0 + "_2"),
-    ]
-    for k in params:
-        vk = k.replace(":", "")
-        if vk not in (v0, v1) and vk not in out_set:
-            constraints.append(
-                getattr(ctx1, vk) == getattr(ctx2, vk)
-            )
-    return constraints
+def _collect_inv_groups(ir, all_loops, progfl):
+    """Return a list of (inv_exprs, inv_source) per loop — shared by all properties."""
+    sidecar_groups = _parse_inv_file_multi(progfl)
+    groups = []
+    for k, lp in enumerate(all_loops):
+        ann = _annotations_for_loop(ir, lp[0])
+        if ann:
+            groups.append((ann, f"from @@ annotations (loop {k+1})"))
+        elif sidecar_groups and k < len(sidecar_groups):
+            groups.append((sidecar_groups[k], f"from .inv sidecar (group {k+1})"))
+        else:
+            groups.append((None, "auto-generated"))
+    return groups
 
 
-def check_symmetry_loop(irHandler, params, swap, low_outputs, inv_vars=None, progfl=None):
-    """
-    Symmetry-2 check for programs with one or more repeat-loops.
-
-    The symmetry property:  f(..., a, b, ...) == f(..., b, a, ...)
-    is encoded as a relational property between two traces where the swapped
-    inputs are cross-equal.  The same 3-check inductive proof used for
-    non-interference is reused, but:
-      - Check 1 (Init):        swap constraints hold at loop entry -> INV holds
-      - Check 2 (Preservation): body preserves INV given swap constraints
-      - Check 3 (Consequence):  INV at exit -> outputs agree despite the swap
-
-    For multiple sequential loops, dispatches to check_symmetry_multi_loop.
-    """
-    v0 = swap[0].replace(":", "")
-    v1 = swap[1].replace(":", "")
-
-    print("\n=== Symmetry-2 Verifier (Tier 2: loop) ===")
-    print(f"  Swapped inputs : {swap[0]} <-> {swap[1]}")
-    print(f"  Low outputs    : {low_outputs}")
-
-    all_loops = find_all_loops(irHandler.ir)
-    if not all_loops:
-        print("  [!] No loop found — falling back to Tier 1 (straight-line).")
-        return check_symmetry(irHandler, params, swap, low_outputs)
-
-    if len(all_loops) > 1:
-        inv_groups_multi = []
-        sidecar_groups = _parse_inv_file_multi(progfl)
-        for k, lp in enumerate(all_loops):
-            lp_head = lp[0]
-            ann = _annotations_for_loop(irHandler.ir, lp_head)
-            if ann:
-                inv_groups_multi.append((ann, f"from @@ annotations (loop {k+1})"))
-            elif sidecar_groups and k < len(sidecar_groups):
-                inv_groups_multi.append((sidecar_groups[k], f"from .inv sidecar (group {k+1})"))
-            else:
-                inv_groups_multi.append((None, "auto-generated"))
-        return check_symmetry_multi_loop(
-            irHandler, all_loops, params, swap, low_outputs,
-            inv_groups_multi, progfl=progfl
-        )
-
-    loop = all_loops[0]
-    head_idx, body_start, body_end, exit_idx = loop
-    pre_loop_ir  = irHandler.ir[:head_idx]
-    body_ir      = irHandler.ir[body_start:body_end]
-    post_loop_ir = irHandler.ir[exit_idx:]
-    loop_cond    = irHandler.ir[head_idx][0]
-
-    print(f"\n  Loop head : IR[{head_idx}]  condition: {loop_cond}")
-    print(f"  Body      : IR[{body_start}:{body_end}]")
-    print(f"  Exit      : IR[{exit_idx}]")
-    print(f"  Post-loop : IR[{exit_idx}:{len(irHandler.ir)}]")
-
-    # Collect loop counters
+def _resolve_inv_for_loop(ir, head_idx, exit_idx, progfl):
+    """Return (inv_exprs, inv_source, auto_counters) for a single loop."""
     auto_counters = []
-    for stmt, _ in irHandler.ir[head_idx - 1:exit_idx]:
+    for stmt, _ in ir[head_idx - 1:exit_idx]:
         if isinstance(stmt, ChironAST.AssignmentCommand):
             v = str(stmt.lvar).replace(":", "")
             if "__rep_counter_" in v and v not in auto_counters:
                 auto_counters.append(v)
 
-    # Resolve invariant (annotations > sidecar > auto)
-    inv_exprs = None
-    annotated = [str(stmt.expr) for stmt, _ in irHandler.ir
+    annotated = [str(stmt.expr) for stmt, _ in ir
                  if isinstance(stmt, ChironAST.InvariantAnnotation)]
     if annotated:
-        inv_exprs = annotated
-        inv_source = "from @@ annotations"
-    else:
-        inv_exprs = _parse_inv_file(progfl)
-        inv_source = "from .inv sidecar" if inv_exprs else None
+        return annotated, "from @@ annotations", auto_counters
 
-    if inv_vars is None:
-        if inv_exprs is not None:
-            inv_vars = _extract_inv_vars(inv_exprs)
-            for v in auto_counters:
-                if v not in inv_vars: inv_vars.append(v)
-            for v in [x.replace(":", "") for x in low_outputs]:
-                if v not in inv_vars: inv_vars.append(v)
-            for vname in (v0, v1):
-                if vname not in inv_vars: inv_vars.append(vname)
-        else:
-            inv_vars = list({v0, v1} | {v.replace(":", "") for v in low_outputs})
-            for v in auto_counters:
-                if v not in inv_vars: inv_vars.append(v)
+    inv_exprs = _parse_inv_file(progfl)
+    inv_source = "from .inv sidecar" if inv_exprs else None
+    return inv_exprs, inv_source, auto_counters
+
+
+def _build_inv_vars(inv_exprs, auto_counters, low_outputs, extra_vars=()):
+    """Build the inv_vars list given an invariant specification."""
+    lo_stripped = [v.replace(":", "") for v in low_outputs]
+    if inv_exprs is not None:
+        iv = _extract_inv_vars(inv_exprs)
+        for v in auto_counters + lo_stripped + list(extra_vars):
+            if v not in iv:
+                iv.append(v)
+    else:
+        seen = set()
+        iv = []
+        for v in list(extra_vars) + lo_stripped + auto_counters:
+            if v not in seen:
+                seen.add(v)
+                iv.append(v)
+    return iv
+
+
+def _show_inv_generic(m, inv_exprs, inv_vars, c1, c2):
+    if inv_exprs is not None:
+        _show_relational_state(m, inv_exprs, c1, c2)
+    else:
+        _show_state(m, inv_vars, c1, c2)
+
+
+def _check_relational_loop(prop, irHandler, params, low_outputs,
+                            inv_exprs, inv_source, auto_counters,
+                            pre_loop_ir, body_ir, post_loop_ir,
+                            loop_cond, head_idx, exit_idx,
+                            entry_assumptions=None, label=""):
+    """
+    Run the 3-check inductive proof for ONE loop under a given PropSpec.
+
+    Returns (r1, r2, r3, build_inv_fn, loop_cond, all_pass).
+    `entry_assumptions` is a list of extra Z3 constraints for Check 1
+    (used when chaining multiple loops).
+    """
+    extra = list({v for v in (prop.build_inv.__code__.co_freevars
+                               if hasattr(prop.build_inv, '__code__') else [])})
+
+    # Determine inv_vars for fresh contexts
+    # We pass extra_vars = all vars mentioned in input_constraints that aren't outputs
+    out_set = {v.replace(":", "") for v in low_outputs}
+    all_param_vars = [k.replace(":", "") for k in params if k.replace(":", "") not in out_set]
+    iv = _build_inv_vars(inv_exprs, auto_counters, low_outputs, extra_vars=all_param_vars)
 
     if inv_exprs is not None:
-        print(f"  Invariant : relational expressions {inv_exprs}  ({inv_source})")
+        inv_label = f"relational expressions {inv_exprs}  ({inv_source})"
     else:
-        print(f"  Invariant : {v0}_1=={v1}_2, {v1}_1=={v0}_2, others equal  (auto-generated swap invariant)")
+        inv_label = prop.inv_label if hasattr(prop, 'inv_label') else f"equal across traces for {iv}"
+    if label:
+        print(f"  Invariant : {inv_label}")
 
-    def _build_inv(c1, c2):
-        return _build_sym_inv(c1, c2, v0, v1, inv_vars, inv_exprs, auto_counters, low_outputs)
+    def build_inv(c1, c2):
+        return prop.build_inv(c1, c2, iv, inv_exprs, auto_counters, low_outputs)
 
-    def _show_inv(m, c1, c2):
-        if inv_exprs is not None:
-            _show_relational_state(m, inv_exprs, c1, c2)
-        else:
-            _show_state(m, inv_vars, c1, c2)
+    def show_inv(m, c1, c2):
+        _show_inv_generic(m, inv_exprs, iv, c1, c2)
 
-    # Encode pre-loop for both traces (ctx1 sees normal inputs, ctx2 sees swapped)
+    # Encode entry state
     ctx1_entry = init_context(params, "_1")
     ctx2_entry = init_context(params, "_2")
     encode_stmts(ctx1_entry, pre_loop_ir)
     encode_stmts(ctx2_entry, pre_loop_ir)
 
-    # Build swap + other-input-equality constraints on the initial Z3 vars
-    swap_constraints = _build_swap_constraints(ctx1_entry, ctx2_entry, params, swap, low_outputs)
+    input_cs = prop.input_constraints(ctx1_entry, ctx2_entry, params)
 
     all_pass = True
 
-    # ------------------------------------------------------------------
-    # Check 1: Initialization — swap holds at entry -> INV holds
-    # ------------------------------------------------------------------
-    print("\n  --- Check 1: Initialization ---")
+    # Check 1: Initialization
+    pfx = f"  --- {label} " if label else "  --- "
+    print(f"\n{pfx}Check 1: Initialization ---")
     s1 = Solver()
-    s1.add(*swap_constraints)
-    s1.add(Not(_build_inv(ctx1_entry, ctx2_entry)))
+    s1.add(*input_cs)
+    if entry_assumptions:
+        s1.add(*entry_assumptions)
+    s1.add(Not(build_inv(ctx1_entry, ctx2_entry)))
     r1 = s1.check()
-    _print_check("Initialization", r1,
-                 "INV holds at loop entry under swap",
-                 "INV does NOT hold at entry — check your invariant or pre-loop code")
+    _print_check("Initialization", r1, prop.init_pass_msg, prop.init_fail_msg)
     if r1 == sat:
-        m = s1.model()
-        print("    Counterexample:")
-        _show_inv(m, ctx1_entry, ctx2_entry)
+        show_inv(s1.model(), ctx1_entry, ctx2_entry)
         all_pass = False
 
-    # ------------------------------------------------------------------
     # Check 2: Preservation
-    # ------------------------------------------------------------------
-    print("\n  --- Check 2: Preservation ---")
-    ctx1_h = _fresh_ctx(inv_vars + [v0, v1], "_1h")
-    ctx2_h = _fresh_ctx(inv_vars + [v0, v1], "_2h")
+    print(f"\n{pfx}Check 2: Preservation ---")
+    ctx1_h = _fresh_ctx(iv, "_1h")
+    ctx2_h = _fresh_ctx(iv, "_2h")
     _copy_missing_vars(ctx1_entry, ctx1_h, "_1h")
     _copy_missing_vars(ctx2_entry, ctx2_h, "_2h")
-
     ctx1_post = _copy_ctx(ctx1_h)
     ctx2_post = _copy_ctx(ctx2_h)
     encode_stmts(ctx1_post, body_ir)
     encode_stmts(ctx2_post, body_ir)
 
     s2 = Solver()
-    s2.add(_build_inv(ctx1_h, ctx2_h))
+    s2.add(build_inv(ctx1_h, ctx2_h))
     s2.add(encode_condition(ctx1_h, loop_cond))
     s2.add(encode_condition(ctx2_h, loop_cond))
-    s2.add(Not(_build_inv(ctx1_post, ctx2_post)))
+    s2.add(Not(build_inv(ctx1_post, ctx2_post)))
     r2 = s2.check()
-    _print_check("Preservation", r2,
-                 "body preserves INV",
-                 "body BREAKS INV — loop is asymmetric or invariant is too weak")
+    _print_check("Preservation", r2, "body preserves INV", "body BREAKS INV — invariant too weak or loop violates property")
     if r2 == sat:
         m = s2.model()
         print("    Counterexample — one iteration that breaks INV:")
-        print("    Before body:")
-        _show_inv(m, ctx1_h, ctx2_h)
-        print("    After body:")
-        _show_inv(m, ctx1_post, ctx2_post)
+        print("    Before body:"); show_inv(m, ctx1_h, ctx2_h)
+        print("    After body:");  show_inv(m, ctx1_post, ctx2_post)
         all_pass = False
 
-    # ------------------------------------------------------------------
-    # Check 3: Consequence — INV at exit + loop done -> outputs agree
-    # ------------------------------------------------------------------
-    print("\n  --- Check 3: Consequence ---")
-    ctx1_e = _fresh_ctx(inv_vars + [v0, v1] + [x.replace(":", "") for x in low_outputs], "_1e")
-    ctx2_e = _fresh_ctx(inv_vars + [v0, v1] + [x.replace(":", "") for x in low_outputs], "_2e")
+    # Check 3: Consequence
+    print(f"\n{pfx}Check 3: Consequence ---")
+    ctx1_e = _fresh_ctx(iv, "_1e")
+    ctx2_e = _fresh_ctx(iv, "_2e")
     _copy_missing_vars(ctx1_entry, ctx1_e, "_1e")
     _copy_missing_vars(ctx2_entry, ctx2_e, "_2e")
-
-    # Encode post-loop code on copies of the exit contexts
     ctx1_final = _copy_ctx(ctx1_e)
     ctx2_final = _copy_ctx(ctx2_e)
     encode_stmts(ctx1_final, post_loop_ir)
     encode_stmts(ctx2_final, post_loop_ir)
 
-    diverge = Or(*[
-        getattr(ctx1_final, v.replace(":", "")) != getattr(ctx2_final, v.replace(":", ""))
-        for v in low_outputs
-    ])
     s3 = Solver()
-    s3.add(_build_inv(ctx1_e, ctx2_e))
+    s3.add(build_inv(ctx1_e, ctx2_e))
     s3.add(Not(encode_condition(ctx1_e, loop_cond)))
     s3.add(Not(encode_condition(ctx2_e, loop_cond)))
-    s3.add(diverge)
+    s3.add(prop.divergence(ctx1_final, ctx2_final, low_outputs))
     r3 = s3.check()
-    _print_check("Consequence", r3,
-                 "INV at exit implies outputs agree despite swap",
-                 "outputs diverge after swap — program is asymmetric")
+    _print_check("Consequence", r3, prop.cons_pass_msg, prop.cons_fail_msg)
     if r3 == sat:
-        m = s3.model()
-        print("    Counterexample — exit state where outputs diverge:")
-        _show_inv(m, ctx1_e, ctx2_e)
+        show_inv(s3.model(), ctx1_e, ctx2_e)
         all_pass = False
 
-    print(f"\n  --- Overall ---")
-    if all_pass:
-        print(f"  SYMMETRY-2: HOLDS (f(...,{swap[0]},{swap[1]},...) == f(...,{swap[1]},{swap[0]},...))")
-    else:
-        print(f"  SYMMETRY-2: FAILS (outputs differ when {swap[0]} and {swap[1]} are swapped)")
-    print("===========================================\n")
-    return "unsat" if all_pass else "sat"
+    return r1, r2, r3, build_inv, loop_cond, all_pass
 
 
-def check_symmetry_multi_loop(irHandler, loops, params, swap, low_outputs,
-                               inv_groups, progfl=None):
+def _check_relational_multi_loop(prop, irHandler, loops, params, low_outputs,
+                                  inv_groups, prop_header):
     """
-    Symmetry-2 check for programs with multiple sequential (non-nested) loops.
-
-    Mirrors check_multi_loop_non_interference but injects swap constraints
-    instead of low-input-equality constraints.
+    Generic multi-loop 3-check engine for any PropSpec.
+    Encodes inter-loop code on a real symbolic ctx pair and runs
+    _check_relational_loop per loop, chaining exit invariants.
     """
-    v0 = swap[0].replace(":", "")
-    v1 = swap[1].replace(":", "")
-
-    print("\n=== Symmetry-2 Verifier (Tier 2b: multi-loop) ===")
-    print(f"  Swapped inputs : {swap[0]} <-> {swap[1]}")
-    print(f"  Low outputs    : {low_outputs}")
-    print(f"  Loops found    : {len(loops)}")
-
     full_ir = irHandler.ir
+    out_set = {v.replace(":", "") for v in low_outputs}
 
     ctx1 = init_context(params, "_1")
     ctx2 = init_context(params, "_2")
@@ -1322,12 +1218,10 @@ def check_symmetry_multi_loop(irHandler, loops, params, swap, low_outputs,
         encode_stmts(ctx1, pre_ir)
         encode_stmts(ctx2, pre_ir)
 
-    # Swap + other-input-equality constraints (on the initial Z3 vars)
-    swap_constraints = _build_swap_constraints(ctx1, ctx2, params, swap, low_outputs)
+    input_cs = prop.input_constraints(ctx1, ctx2, params)
 
     all_safe = True
     prev_exit_constraints = []
-    prev_loop_cond = None
 
     for k, loop in enumerate(loops):
         head_idx, body_start, body_end, exit_idx = loop
@@ -1348,7 +1242,6 @@ def check_symmetry_multi_loop(irHandler, loops, params, swap, low_outputs,
 
         inv_exprs, inv_source = inv_groups[k]
 
-        # Collect counters for this loop
         auto_counters = []
         for stmt, _ in full_ir[head_idx - 1:exit_idx]:
             if isinstance(stmt, ChironAST.AssignmentCommand):
@@ -1356,120 +1249,90 @@ def check_symmetry_multi_loop(irHandler, loops, params, swap, low_outputs,
                 if "__rep_counter_" in v and v not in auto_counters:
                     auto_counters.append(v)
 
-        if inv_exprs is not None:
-            inv_vars = _extract_inv_vars(inv_exprs)
-            for v in auto_counters:
-                if v not in inv_vars: inv_vars.append(v)
-            for v in [x.replace(":", "") for x in low_outputs]:
-                if v not in inv_vars: inv_vars.append(v)
-            for vname in (v0, v1):
-                if vname not in inv_vars: inv_vars.append(vname)
-            print(f"\n  {'='*10} {label} {'='*10}")
-            print(f"  Invariant : relational expressions {inv_exprs}  ({inv_source})")
-        else:
-            inv_vars = list({v0, v1} | {v.replace(":", "") for v in low_outputs})
-            for v in auto_counters:
-                if v not in inv_vars: inv_vars.append(v)
-            print(f"\n  {'='*10} {label} {'='*10}")
-            print(f"  Invariant : {v0}_1=={v1}_2, {v1}_1=={v0}_2, others equal  (auto-generated swap invariant)")
+        all_param_vars = [k2.replace(":", "") for k2 in params if k2.replace(":", "") not in out_set]
+        iv = _build_inv_vars(inv_exprs, auto_counters, low_outputs, extra_vars=all_param_vars)
 
+        if inv_exprs is not None:
+            inv_label = f"relational expressions {inv_exprs}  ({inv_source})"
+        else:
+            inv_label = prop.inv_label if hasattr(prop, 'inv_label') else f"equal across traces for {iv}"
+
+        print(f"\n  {'='*10} {label} {'='*10}")
+        print(f"  Invariant : {inv_label}")
         print(f"  Loop head : IR[{head_idx}]  condition: {loop_cond}")
         print(f"  Body      : IR[{body_start}:{body_end}]")
 
-        def _build_inv(c1, c2, _inv_exprs=inv_exprs, _auto_counters=auto_counters, _inv_vars=inv_vars):
-            return _build_sym_inv(c1, c2, v0, v1, _inv_vars, _inv_exprs, _auto_counters, low_outputs)
+        def build_inv(c1, c2, _iv=iv, _ie=inv_exprs, _ac=auto_counters):
+            return prop.build_inv(c1, c2, _iv, _ie, _ac, low_outputs)
 
-        def _show_inv(m, c1, c2, _inv_exprs=inv_exprs, _inv_vars=inv_vars):
-            if _inv_exprs is not None:
-                _show_relational_state(m, _inv_exprs, c1, c2)
-            else:
-                _show_state(m, _inv_vars, c1, c2)
+        def show_inv(m, c1, c2, _ie=inv_exprs, _iv=iv):
+            _show_inv_generic(m, _ie, _iv, c1, c2)
 
-        # ------------------------------------------------------------------
-        # Check 1: Initialization
-        # ------------------------------------------------------------------
+        # Check 1: Initialization (use real ctx, not fresh)
         print(f"\n  --- {label} Check 1: Initialization ---")
         s1 = Solver()
-        s1.add(*swap_constraints)
+        s1.add(*input_cs)
         if prev_exit_constraints:
             s1.add(*prev_exit_constraints)
-        s1.add(Not(_build_inv(ctx1, ctx2)))
+        s1.add(Not(build_inv(ctx1, ctx2)))
         r1 = s1.check()
-        _print_check("Initialization", r1,
-                     "INV holds at loop entry under swap",
-                     "INV does NOT hold at entry")
+        _print_check("Initialization", r1, prop.init_pass_msg, prop.init_fail_msg)
         if r1 == sat:
-            m = s1.model()
-            _show_inv(m, ctx1, ctx2)
+            show_inv(s1.model(), ctx1, ctx2)
             all_safe = False
 
-        # ------------------------------------------------------------------
         # Check 2: Preservation
-        # ------------------------------------------------------------------
         print(f"\n  --- {label} Check 2: Preservation ---")
-        ctx1_h = _fresh_ctx(inv_vars + [v0, v1], "_1h")
-        ctx2_h = _fresh_ctx(inv_vars + [v0, v1], "_2h")
+        ctx1_h = _fresh_ctx(iv, "_1h")
+        ctx2_h = _fresh_ctx(iv, "_2h")
         _copy_missing_vars(ctx1, ctx1_h, "_1h")
         _copy_missing_vars(ctx2, ctx2_h, "_2h")
-
         ctx1_post = _copy_ctx(ctx1_h)
         ctx2_post = _copy_ctx(ctx2_h)
         encode_stmts(ctx1_post, body_ir)
         encode_stmts(ctx2_post, body_ir)
 
         s2 = Solver()
-        s2.add(_build_inv(ctx1_h, ctx2_h))
+        s2.add(build_inv(ctx1_h, ctx2_h))
         s2.add(encode_condition(ctx1_h, loop_cond))
         s2.add(encode_condition(ctx2_h, loop_cond))
-        s2.add(Not(_build_inv(ctx1_post, ctx2_post)))
+        s2.add(Not(build_inv(ctx1_post, ctx2_post)))
         r2 = s2.check()
-        _print_check("Preservation", r2,
-                     "body preserves INV",
-                     "body BREAKS INV")
+        _print_check("Preservation", r2, "body preserves INV", "body BREAKS INV")
         if r2 == sat:
             m = s2.model()
-            print("    Counterexample:")
-            _show_inv(m, ctx1_h, ctx2_h)
+            print("    Before body:"); show_inv(m, ctx1_h, ctx2_h)
+            print("    After body:");  show_inv(m, ctx1_post, ctx2_post)
             all_safe = False
 
-        # ------------------------------------------------------------------
         # Check 3: Consequence
-        # ------------------------------------------------------------------
         print(f"\n  --- {label} Check 3: Consequence ---")
-        ctx1_e = _fresh_ctx(inv_vars + [v0, v1] + [x.replace(":", "") for x in low_outputs], "_1e")
-        ctx2_e = _fresh_ctx(inv_vars + [v0, v1] + [x.replace(":", "") for x in low_outputs], "_2e")
+        ctx1_e = _fresh_ctx(iv, "_1e")
+        ctx2_e = _fresh_ctx(iv, "_2e")
         _copy_missing_vars(ctx1, ctx1_e, "_1e")
         _copy_missing_vars(ctx2, ctx2_e, "_2e")
 
-        diverge = Or(*[
-            getattr(ctx1_e, v.replace(":", "")) != getattr(ctx2_e, v.replace(":", ""))
-            for v in low_outputs
-        ])
         s3 = Solver()
-        s3.add(_build_inv(ctx1_e, ctx2_e))
+        s3.add(build_inv(ctx1_e, ctx2_e))
         s3.add(Not(encode_condition(ctx1_e, loop_cond)))
         s3.add(Not(encode_condition(ctx2_e, loop_cond)))
-        s3.add(diverge)
+        s3.add(prop.divergence(ctx1_e, ctx2_e, low_outputs))
         r3 = s3.check()
-        _print_check("Consequence", r3,
-                     "INV at exit implies outputs agree despite swap",
-                     "outputs diverge after swap at this loop's exit")
+        _print_check("Consequence", r3, prop.cons_pass_msg, prop.cons_fail_msg)
         if r3 == sat:
-            m = s3.model()
-            _show_inv(m, ctx1_e, ctx2_e)
+            show_inv(s3.model(), ctx1_e, ctx2_e)
             all_safe = False
 
-        loop_safe = (r1 == unsat) and (r2 == unsat) and (r3 == unsat)
-        if not loop_safe:
+        if not ((r1 == unsat) and (r2 == unsat) and (r3 == unsat)):
             all_safe = False
 
         prev_exit_constraints = [
-            _build_inv(ctx1, ctx2),
+            build_inv(ctx1, ctx2),
             Not(encode_condition(ctx1, loop_cond)),
             Not(encode_condition(ctx2, loop_cond)),
         ]
 
-    # -- Final output check after all loops --
+    # Final output check after all loops
     last_exit = loops[-1][3]
     post_ir = full_ir[last_exit:]
     if post_ir:
@@ -1478,22 +1341,15 @@ def check_symmetry_multi_loop(irHandler, loops, params, swap, low_outputs,
         encode_stmts(ctx2, post_ir)
 
     print(f"\n  --- Final output check (after all loops) ---")
-    diverge_final = Or(*[
-        getattr(ctx1, v.replace(":", "")) != getattr(ctx2, v.replace(":", ""))
-        for v in low_outputs
-    ])
     s_fin = Solver()
-    s_fin.add(*swap_constraints)
+    s_fin.add(*input_cs)
     if prev_exit_constraints:
         s_fin.add(*prev_exit_constraints)
-    s_fin.add(diverge_final)
+    s_fin.add(prop.divergence(ctx1, ctx2, low_outputs))
     r_fin = s_fin.check()
-    _print_check("Final outputs", r_fin,
-                 "outputs agree after all loops despite swap",
-                 "outputs diverge after all loops — program is asymmetric")
+    _print_check("Final outputs", r_fin, prop.cons_pass_msg, prop.cons_fail_msg)
     if r_fin == sat:
         m = s_fin.model()
-        print("    Counterexample — final output state where outputs diverge:")
         for v in low_outputs:
             vn = v.replace(":", "")
             o1 = m.eval(_z3_wrap(getattr(ctx1, vn)), model_completion=True)
@@ -1503,12 +1359,272 @@ def check_symmetry_multi_loop(irHandler, loops, params, swap, low_outputs,
         all_safe = False
 
     print(f"\n  --- Overall ---")
-    if all_safe:
-        print(f"  SYMMETRY-2: HOLDS (all loops verified)")
-    else:
-        print(f"  SYMMETRY-2: FAILS (see failed checks above)")
+    print(f"  {prop.name}: {'HOLDS (all loops verified)' if all_safe else 'FAILS (see failed checks above)'}")
     print("=================================================================\n")
     return "unsat" if all_safe else "sat"
+
+
+# ---------------------------------------------------------------------------
+# Symmetry-2: thin wrapper over the generic engine
+# ---------------------------------------------------------------------------
+
+def _sym_build_inv(c1, c2, inv_vars, inv_exprs, auto_counters, low_outputs, v0, v1):
+    """Relational invariant for symmetry: cross-equalities for (v0,v1), simple eq for rest."""
+    if inv_exprs is not None:
+        rel = build_relational_invariant(c1, c2, inv_exprs)
+        auto_eq = [getattr(c1, v) == getattr(c2, v) for v in auto_counters]
+        inv_expr_vars = set(_extract_inv_vars(inv_exprs))
+        for v in [x.replace(":", "") for x in low_outputs]:
+            if v not in inv_expr_vars:
+                auto_eq.append(getattr(c1, v) == getattr(c2, v))
+        return And(rel, *auto_eq) if auto_eq else rel
+    clauses = [getattr(c1, v0) == getattr(c2, v1), getattr(c1, v1) == getattr(c2, v0)]
+    for v in inv_vars:
+        if v not in (v0, v1):
+            clauses.append(getattr(c1, v) == getattr(c2, v))
+    return And(*clauses)
+
+
+def _make_sym_prop(swap, low_outputs):
+    v0 = swap[0].replace(":", "")
+    v1 = swap[1].replace(":", "")
+    out_set = {v.replace(":", "") for v in low_outputs}
+
+    def input_constraints(ctx1, ctx2, params):
+        cs = [Int(v0 + "_1") == Int(v1 + "_2"), Int(v1 + "_1") == Int(v0 + "_2")]
+        for k in params:
+            vk = k.replace(":", "")
+            if vk not in (v0, v1) and vk not in out_set:
+                cs.append(getattr(ctx1, vk) == getattr(ctx2, vk))
+        return cs
+
+    def build_inv(c1, c2, inv_vars, inv_exprs, auto_counters, low_outputs):
+        return _sym_build_inv(c1, c2, inv_vars, inv_exprs, auto_counters, low_outputs, v0, v1)
+
+    def divergence(ctx1, ctx2, low_outputs):
+        return Or(*[getattr(ctx1, v.replace(":", "")) != getattr(ctx2, v.replace(":", ""))
+                    for v in low_outputs])
+
+    prop = PropSpec(
+        name="SYMMETRY-2",
+        input_constraints=input_constraints,
+        build_inv=build_inv,
+        divergence=divergence,
+        init_pass_msg="INV holds at loop entry under swap",
+        init_fail_msg="INV does NOT hold at entry — check invariant or pre-loop code",
+        cons_pass_msg="outputs agree despite swap",
+        cons_fail_msg="outputs diverge — program is asymmetric",
+        overall_pass_msg=f"SYMMETRY-2: HOLDS (f(...,{swap[0]},{swap[1]},...) == f(...,{swap[1]},{swap[0]},...))",
+        overall_fail_msg=f"SYMMETRY-2: FAILS (outputs differ when {swap[0]} <-> {swap[1]})",
+        inv_label=f"{v0}_1=={v1}_2, {v1}_1=={v0}_2, others equal  (auto-generated)",
+    )
+    return prop
+
+
+def check_symmetry_all_tiers(irHandler, params, swap, low_outputs, progfl=None):
+    """
+    Symmetry-2 safety: swapping two inputs must not change outputs.
+    Auto-dispatches across Tier 1 / Tier 2 / Tier 2b.
+    """
+    if len(swap) != 2:
+        raise ValueError('--sym requires exactly two variable names, e.g. \'[":a", ":b"]\'')
+
+    v0, v1 = swap[0].replace(":", ""), swap[1].replace(":", "")
+    all_loops = find_all_loops(irHandler.ir)
+
+    print(f"\n=== Symmetry-2 Verifier ===")
+    print(f"  Swapped inputs : {swap[0]} <-> {swap[1]}")
+    print(f"  Low outputs    : {low_outputs}")
+
+    if not all_loops:
+        print("  [Tier dispatch] No loops — Tier 1 (straight-line).")
+        return check_symmetry(irHandler, params, swap, low_outputs)
+
+    prop = _make_sym_prop(swap, low_outputs)
+
+    if len(all_loops) == 1:
+        print("  [Tier dispatch] Single loop — Tier 2.")
+        loop = all_loops[0]
+        head_idx, body_start, body_end, exit_idx = loop
+        inv_exprs, inv_source, auto_counters = _resolve_inv_for_loop(
+            irHandler.ir, head_idx, exit_idx, progfl)
+        r1, r2, r3, _, _, all_pass = _check_relational_loop(
+            prop, irHandler, params, low_outputs,
+            inv_exprs, inv_source, auto_counters,
+            irHandler.ir[:head_idx],
+            irHandler.ir[body_start:body_end],
+            irHandler.ir[exit_idx:],
+            irHandler.ir[head_idx][0],
+            head_idx, exit_idx,
+        )
+        print(f"\n  --- Overall ---")
+        if all_pass:
+            print(f"  {prop.overall_pass_msg}")
+        else:
+            print(f"  {prop.overall_fail_msg}")
+        print("===========================================\n")
+        return "unsat" if all_pass else "sat"
+
+    print(f"  [Tier dispatch] {len(all_loops)} loops — Tier 2b (multi-loop).")
+    inv_groups = _collect_inv_groups(irHandler.ir, all_loops, progfl)
+    return _check_relational_multi_loop(prop, irHandler, all_loops, params, low_outputs,
+                                        inv_groups, prop.name)
+
+
+# ---------------------------------------------------------------------------
+# Monotonicity: thin wrapper over the generic engine
+# ---------------------------------------------------------------------------
+#
+# Property: if input x increases (x_1 <= x_2), all low outputs must not decrease
+#           (out_1 <= out_2 for every low output).
+#
+# Trace 1: smaller input value.  Trace 2: larger input value.
+# Input constraints: mono_var_1 <= mono_var_2, all other inputs equal.
+# Divergence (violation): exists out s.t. out_1 > out_2.
+# Auto-invariant: out_1 <= out_2, counters equal, mono_var_1 <= mono_var_2.
+
+def _mono_build_inv(c1, c2, inv_vars, inv_exprs, auto_counters, low_outputs, mono_var):
+    """
+    Relational invariant for monotonicity.
+
+    When annotated: use user expressions (user must encode the ordering relation).
+    Auto-generated:
+      - mono_var_1 <= mono_var_2  (input ordering is preserved through the loop)
+      - out_1 <= out_2            for every low output
+      - counter_1 == counter_2    loop counters are equal (same public bound)
+      - v_1 == v_2                for all other invariant vars
+    """
+    if inv_exprs is not None:
+        rel = build_relational_invariant(c1, c2, inv_exprs)
+        auto_eq = [getattr(c1, v) == getattr(c2, v) for v in auto_counters]
+        inv_expr_vars = set(_extract_inv_vars(inv_exprs))
+        for v in [x.replace(":", "") for x in low_outputs]:
+            if v not in inv_expr_vars:
+                auto_eq.append(getattr(c1, v) == getattr(c2, v))
+        return And(rel, *auto_eq) if auto_eq else rel
+
+    clauses = []
+    # Input ordering maintained throughout
+    clauses.append(getattr(c1, mono_var) <= getattr(c2, mono_var))
+    # Output ordering: smaller input -> smaller-or-equal output
+    for v in low_outputs:
+        vn = v.replace(":", "")
+        clauses.append(getattr(c1, vn) <= getattr(c2, vn))
+    # Counters and other tracked vars are equal
+    for v in inv_vars:
+        if v != mono_var and v not in {o.replace(":", "") for o in low_outputs}:
+            clauses.append(getattr(c1, v) == getattr(c2, v))
+    return And(*clauses)
+
+
+def _make_mono_prop(mono_var_str, low_outputs):
+    mono_var = mono_var_str.replace(":", "")
+    out_set = {v.replace(":", "") for v in low_outputs}
+
+    def input_constraints(ctx1, ctx2, params):
+        # Trace 1 has the smaller value of mono_var; trace 2 has the larger.
+        cs = [Int(mono_var + "_1") <= Int(mono_var + "_2")]
+        for k in params:
+            vk = k.replace(":", "")
+            if vk != mono_var and vk not in out_set:
+                cs.append(getattr(ctx1, vk) == getattr(ctx2, vk))
+        return cs
+
+    def build_inv(c1, c2, inv_vars, inv_exprs, auto_counters, low_outputs):
+        return _mono_build_inv(c1, c2, inv_vars, inv_exprs, auto_counters, low_outputs, mono_var)
+
+    def divergence(ctx1, ctx2, low_outputs):
+        # Violation: some output is SMALLER in trace 2 than trace 1
+        # i.e. the larger input produced a smaller output
+        return Or(*[getattr(ctx1, v.replace(":", "")) > getattr(ctx2, v.replace(":", ""))
+                    for v in low_outputs])
+
+    prop = PropSpec(
+        name="MONOTONICITY",
+        input_constraints=input_constraints,
+        build_inv=build_inv,
+        divergence=divergence,
+        init_pass_msg="INV holds at loop entry (output ordering matches input ordering)",
+        init_fail_msg="INV does NOT hold at entry — outputs already inverted before loop",
+        cons_pass_msg="larger input produces larger-or-equal output",
+        cons_fail_msg="larger input produces smaller output — monotonicity violated",
+        overall_pass_msg=f"MONOTONICITY: HOLDS ({mono_var_str}_1 <= {mono_var_str}_2 => all outputs non-decreasing)",
+        overall_fail_msg=f"MONOTONICITY: FAILS (increasing {mono_var_str} can decrease an output)",
+        inv_label=(f"{mono_var}_1 <= {mono_var}_2, "
+                   f"outputs non-decreasing, others equal  (auto-generated)"),
+    )
+    return prop
+
+
+def check_monotonicity(irHandler, params, mono_var, low_outputs, progfl=None):
+    """
+    Monotonicity check: increasing mono_var must not decrease any low output.
+    Auto-dispatches across Tier 1 / Tier 2 / Tier 2b.
+
+    mono_var: string like ':x'
+    """
+    all_loops = find_all_loops(irHandler.ir)
+
+    print(f"\n=== Monotonicity Verifier ===")
+    print(f"  Monotone input : {mono_var}")
+    print(f"  Low outputs    : {low_outputs}")
+
+    prop = _make_mono_prop(mono_var, low_outputs)
+
+    if not all_loops:
+        print("  [Tier dispatch] No loops — Tier 1 (straight-line).")
+        # Tier 1: direct Z3 query, no invariant needed
+        ctx1 = init_context(params, "_1")
+        ctx2 = init_context(params, "_2")
+        encode_stmts(ctx1, irHandler.ir)
+        encode_stmts(ctx2, irHandler.ir)
+        input_cs = prop.input_constraints(ctx1, ctx2, params)
+        s = Solver()
+        s.add(*input_cs)
+        s.add(prop.divergence(ctx1, ctx2, low_outputs))
+        result = s.check()
+        if result == unsat:
+            print(f"\n  {prop.overall_pass_msg}")
+        elif result == sat:
+            m = s.model()
+            print(f"\n  {prop.overall_fail_msg}  Counterexample:")
+            mv = mono_var.replace(":", "")
+            v1_val = m.eval(_z3_wrap(getattr(ctx1, mv)), model_completion=True)
+            v2_val = m.eval(_z3_wrap(getattr(ctx2, mv)), model_completion=True)
+            print(f"    {mono_var}: trace1={v1_val}, trace2={v2_val}  (trace1 <= trace2)")
+            for v in low_outputs:
+                vn = v.replace(":", "")
+                o1 = m.eval(_z3_wrap(getattr(ctx1, vn)), model_completion=True)
+                o2 = m.eval(_z3_wrap(getattr(ctx2, vn)), model_completion=True)
+                tag = " <-- DECREASES" if str(o1) > str(o2) else ""
+                print(f"    {v}: trace1={o1}, trace2={o2}{tag}")
+        print("=============================\n")
+        return str(result)
+
+    if len(all_loops) == 1:
+        print("  [Tier dispatch] Single loop — Tier 2.")
+        loop = all_loops[0]
+        head_idx, body_start, body_end, exit_idx = loop
+        inv_exprs, inv_source, auto_counters = _resolve_inv_for_loop(
+            irHandler.ir, head_idx, exit_idx, progfl)
+        r1, r2, r3, _, _, all_pass = _check_relational_loop(
+            prop, irHandler, params, low_outputs,
+            inv_exprs, inv_source, auto_counters,
+            irHandler.ir[:head_idx],
+            irHandler.ir[body_start:body_end],
+            irHandler.ir[exit_idx:],
+            irHandler.ir[head_idx][0],
+            head_idx, exit_idx,
+        )
+        print(f"\n  --- Overall ---")
+        print(f"  {prop.overall_pass_msg if all_pass else prop.overall_fail_msg}")
+        print("=============================\n")
+        return "unsat" if all_pass else "sat"
+
+    print(f"  [Tier dispatch] {len(all_loops)} loops — Tier 2b (multi-loop).")
+    inv_groups = _collect_inv_groups(irHandler.ir, all_loops, progfl)
+    return _check_relational_multi_loop(prop, irHandler, all_loops, params, low_outputs,
+                                        inv_groups, prop.name)
 
 
 # ---------------------------------------------------------------------------
@@ -1586,14 +1702,14 @@ def check_loop_non_interference(irHandler, params, low_inputs, low_outputs, inv_
             # leak too (different iteration counts -> different output values).
             # Fall through to the standard 3-check machinery so the full
             # counterexample is reported — but warn about the bound first.
-            print(f"\n  [!] WARNING: Loop bound '{bound_str}' depends on secret variable(s): {tainted_vars}")
+            print(f"\n  [!] WARNING: Loop bound '{bound_str}' is non low")
             print(f"  The body also writes a low output — this is a VALUE LEAK, not just a timing leak.")
             print(f"  Continuing with standard invariant checks to produce a full counterexample...\n")
         else:
             # Body never touches any low output, so the only observable difference
             # between two runs with different secrets is the number of iterations.
             print(f"\n  [!] TIMING SIDE-CHANNEL DETECTED")
-            print(f"  The loop bound '{bound_str}' depends on secret variable(s): {tainted_vars}")
+            print(f"  The loop bound '{bound_str}' is non low")
             print(f"  The loop body does NOT write any low output, so there is no direct value leak.")
             print(f"  However, an observer can infer the secret by counting loop iterations")
             print(f"  (e.g. via execution time, energy consumption, or cache behaviour).")

@@ -145,12 +145,6 @@ if __name__ == "__main__":
         help='List of low (public) output variables, e.g. \'[":out"]\'',
     )
     cmdparser.add_argument(
-        "--swap",
-        default=[],
-        type=ast.literal_eval,
-        help='Pair of input variables to swap between traces for symmetry checking, e.g. \'[":a", ":b"]\'',
-    )
-    cmdparser.add_argument(
         "--sym",
         default=[],
         type=ast.literal_eval,
@@ -158,6 +152,15 @@ if __name__ == "__main__":
             'Check symmetry-2 safety: outputs must not change when two inputs are swapped. '
             'Auto-dispatches across all tiers (straight-line, single loop, multi-loop). '
             'E.g. \'[":a", ":b"]\''
+        ),
+    )
+    cmdparser.add_argument(
+        "--mono",
+        default="",
+        type=str,
+        help=(
+            'Check monotonicity: increasing this input must not decrease any low output. '
+            'Auto-dispatches across all tiers. E.g. \'":x"\''
         ),
     )
 
@@ -327,22 +330,6 @@ if __name__ == "__main__":
             progfl=args.progfl,
         )
 
-    if args.swap:
-        if not args.params:
-            raise RuntimeError(
-                "Symmetry checking needs all program variables listed. Use '-d'."
-            )
-        if len(args.swap) != 2:
-            raise RuntimeError(
-                "--swap requires exactly two variable names, e.g. '[\":a\", \":b\"]'"
-            )
-        rv.check_symmetry(
-            irHandler,
-            params=args.params,
-            swap=args.swap,
-            low_outputs=args.low_out,
-        )
-
     if args.sym:
         if not args.params:
             raise RuntimeError(
@@ -356,6 +343,22 @@ if __name__ == "__main__":
             irHandler,
             params=args.params,
             swap=args.sym,
+            low_outputs=args.low_out,
+            progfl=args.progfl,
+        )
+
+    if args.mono:
+        if not args.params:
+            raise RuntimeError(
+                "Monotonicity checking needs all program variables listed. Use '-d'."
+            )
+        mono_var = args.mono.strip()
+        if not mono_var.startswith(":"):
+            mono_var = ":" + mono_var
+        rv.check_monotonicity(
+            irHandler,
+            params=args.params,
+            mono_var=mono_var,
             low_outputs=args.low_out,
             progfl=args.progfl,
         )

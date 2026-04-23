@@ -38,7 +38,10 @@ If you want to cite this work, you may use this.
   keywords={Surveys;Computer languages;Program processors;Software algorithms;Software systems;Task analysis;Engines;program analysis verification and testing;programming languages;software engineering;graduate level course;education},
   doi={10.1109/ASE56229.2023.00101}}
 ```
-### Installing Dependencies
+
+---
+
+## Installing Dependencies
 
 You need to install `java` Runtime and dependency libs. You may also need to install java JDK (`javac`) on older Windows machine.
 Python, pip and other packages are also required. Please follow the steps given below.
@@ -58,7 +61,7 @@ PowerShell Preview Microsoft.PowerShell.Preview 7.6.0.6 winget
 winget install --id Microsoft.PowerShell --source winget
 ```
  
-#### Installing Java
+### Installing Java
 
 Installing the lastest java package for your operating system. 
 
@@ -74,7 +77,7 @@ $ javac --version
 javac 21.0.9
 ```
 
-#### Installing Python.
+### Installing Python
 
 We recommend using the latest version of Python (`python3.14`) with python install manager.
 
@@ -88,7 +91,7 @@ $ python3.14 --version
 Python 3.14.2
 ```
 
-#### Installing UV (astral) package manager.
+### Installing UV (astral) package manager
 
 We recommend using `uv` package manager to handle python dependencies for Chiron. 
 Virtual environment with `uv` also works without issues.
@@ -117,7 +120,7 @@ $ pip install antlr4-python3-runtime==4.13.2 networkx z3-solver numpy
 $ sudo apt-get install python3-tk
 ```
 
-### Generating the ANTLR files.
+### Generating the ANTLR files
 
 The `antlr` files need to be rebuilt if any changes are made to the `tlang.g4` file or when installing Chiron for the first time.
 We use a visitor pattern to generate the AST from parsing. 
@@ -130,7 +133,7 @@ You may download the latest antlr version complete jar binary to the `\ChironCor
 
 From the directory shown in the command below, build the antlr related visitor code with java and latest antlr runtime jar files.
 
-```
+```bash
 $ cd ChironCore/turtparse
 $ java -cp ../extlib/antlr-4.13.2-complete.jar org.antlr.v4.Tool -Dlanguage=Python3 -visitor -no-listener tlang.g4
 ```
@@ -142,7 +145,7 @@ To pass parameters (input params) for running a turtle program, use the `-d` fla
 
 ```bash
 $ cd ChironCore
-$ ./chiron.py -r ./example/example1.tl -d '{":x": 20, "y": 30, ":z": 20, ":p": 40}'
+$ python3 chiron.py -r ./example/example1.tl -d '{":x": 20, "y": 30, ":z": 20, ":p": 40}'
 ```
 
 If you are using `uv` package manager, which we highly recommend using, run `Chiron` using the following commands.
@@ -155,133 +158,262 @@ $ uv run chiron.py -r ./example/example1.tl -d '{":x": 20, "y": 30, ":z": 20, ":
 
 ### See help for other command line options
 
-Running with system-wide installed python.
-
 ```bash
-# You may need to use python instead of python3.
 $ python3 chiron.py --help
-
-
-░█████╗░██╗░░██╗██╗██████╗░░█████╗░███╗░░██╗
-██╔══██╗██║░░██║██║██╔══██╗██╔══██╗████╗░██║
-██║░░╚═╝███████║██║██████╔╝██║░░██║██╔██╗██║
-██║░░██╗██╔══██║██║██╔══██╗██║░░██║██║╚████║
-╚█████╔╝██║░░██║██║██║░░██║╚█████╔╝██║░╚███║
-░╚════╝░╚═╝░░╚═╝╚═╝╚═╝░░╚═╝░╚════╝░╚═╝░░╚══╝
-
-
-Chiron v1.0.1
-------------
-usage: chiron.py [-h] [-p] [-r] [-gr] [-b] [-z] [-t TIMEOUT] [-d PARAMS] [-c CONSTPARAMS] [-se] [-ai] [-dfa] [-sbfl]
-                 [-bg BUGGY] [-vars INPUTVARSLIST] [-nt NTESTS] [-pop POPSIZE] [-cp CXPB] [-mp MUTPB] [-ng NGEN]
-                 [-vb VERBOSE]
-                 progfl
-
-Program Analysis Framework for ChironLang Programs.
-
-positional arguments:
-  progfl
-
-options:
-  -h, --help            show this help message and exit
-  -p, --ir              pretty printing the IR of a Chiron program to stdout (terminal)
-  -r, --run             execute Chiron program, the figure/shapes the turle draws is shown in a UI.
-  -gr, --fuzzer_gen_rand
-                        Generate random input seeds for the fuzzer before fuzzing starts.
-  -b, --bin             load binary IR of a Chiron program
-  -z, --fuzz            Run fuzzer on a Chiron program (seed values with '-d' or '--params' flag needed.)
-  -t TIMEOUT, --timeout TIMEOUT
-                        Timeout Parameter for Analysis (in secs). This is the total timeout.
-  -d PARAMS, --params PARAMS
-                        pass variable values to Chiron program in python dictionary format
-  -c CONSTPARAMS, --constparams CONSTPARAMS
-                        pass variable(for which you have to find values using circuit equivalence) values to Chiron program
-                        in python dictionary format
-  -se, --symbolicExecution
-                        Run Symbolic Execution on a Chiron program (seed values with '-d' or '--params' flag needed) to
-                        generate test cases along all possible paths.
-  -ai, --abstractInterpretation
-                        Run abstract interpretation on a Chiron Program.
-  -dfa, --dataFlowAnalysis
-                        Run data flow analysis using worklist algorithm on a Chiron Program.
-  -sbfl, --SBFL         Run Spectrum-basedFault localizer on Chiron program
-  -bg BUGGY, --buggy BUGGY
-                        buggy Chiron program path
-  -vars INPUTVARSLIST, --inputVarsList INPUTVARSLIST
-                        A list of input variables of given Chiron program
-  -nt NTESTS, --ntests NTESTS
-                        number of tests to generate
-  -pop POPSIZE, --popsize POPSIZE
-                        population size for Genetic Algorithm.
-  -cp CXPB, --cxpb CXPB
-                        cross-over probability
-  -mp MUTPB, --mutpb MUTPB
-                        mutation probability
-  -ng NGEN, --ngen NGEN
-                        number of times Genetic Algorithm iterates
-  -vb VERBOSE, --verbose VERBOSE
-                        To display computation to Console
-
 ```
 
-Running with `uv`.
+---
+
+## Relational Verification of Hyperproperties (CS335 Project Extension)
+
+This extension adds a **relational verification** pass to Chiron that checks security hyperproperties over pairs of program executions using the Z3 SMT solver. Three properties are supported:
+
+| Property | Question | Flag |
+|---|---|---|
+| **Non-interference** | Can secret inputs influence public outputs? | `-rv` / `-rvl` |
+| **Symmetry-2** | Does swapping two inputs change any output? | `--sym` |
+| **Monotonicity** | Can increasing an input decrease any output? | `--mono` |
+
+All three properties are checked across three program tiers:
+- **Tier 1** — straight-line programs and conditionals (`if`/`else`)
+- **Tier 2** — programs with a single `repeat`-loop
+- **Tier 2b** — programs with multiple sequential `repeat`-loops
+
+### Files Changed
+
+| File | Change |
+|---|---|
+| `ChironCore/relationalVerifier.py` | **New.** Core verifier: dual-context Z3 encoding, 3-check inductive loop proof, turtle symbolic model, path/position safety, `_merge_contexts` for conditionals, `@@` annotation scanning, `.inv` sidecar parsing, timing side-channel detection, Tier 2b multi-loop engine, `PropSpec` generic 2-safety engine, symmetry-2 and monotonicity. |
+| `ChironCore/chiron.py` | **Modified.** Added CLI flags: `-rv`, `-rvl`, `--low_in`, `--low_out`, `--sym`, `--mono`. |
+| `ChironCore/turtparse/tlang.g4` | **Modified.** Added `annotation` grammar rule for `@@` invariant annotations; regenerated `tlangParser.py` and `tlangVisitor.py`. |
+| `ChironCore/ChironAST/ChironAST.py` | **Modified.** Added `InvariantAnnotation` AST node. |
+| `ChironCore/ChironAST/builder.py` | **Modified.** Added `visitAnnotation` visitor method. |
+| `ChironCore/example/` | **New files.** 80+ test programs covering all tiers and properties. |
+| `ChironCore/run_tests.sh` | **New.** Automated test runner for symmetry and monotonicity examples. |
+
+---
+
+### Running the Relational Verifier
+
+All commands are run from the `ChironCore/` directory.
+
+#### Non-Interference
+
+**Tier 1 — straight-line programs:**
+```bash
+# Safe: secret never reaches :out
+python3 chiron.py example/ni_safe.tl -rv \
+  -d '{":pub":0, ":secret":0, ":out":0}' \
+  --low_in '[":pub"]' --low_out '[":out"]'
+
+# Leak: :out = :pub + :secret
+python3 chiron.py example/ni_leak.tl -rv \
+  -d '{":pub":0, ":secret":0, ":out":0}' \
+  --low_in '[":pub"]' --low_out '[":out"]'
+```
+
+**Tier 2 — single loop:**
+```bash
+# Safe: loop accumulates :pub only
+python3 chiron.py example/loop_safe.tl -rvl \
+  -d '{":pub":0, ":secret":0, ":n":5, ":out":0}' \
+  --low_in '[":pub",":n"]' --low_out '[":out"]'
+
+# Leak: loop accumulates :secret
+python3 chiron.py example/loop_leak.tl -rvl \
+  -d '{":pub":0, ":secret":0, ":n":5, ":out":0}' \
+  --low_in '[":pub",":n"]' --low_out '[":out"]'
+```
+
+**Tier 2b — multiple sequential loops:**
+```bash
+python3 chiron.py example/multi_loop_safe.tl -rvl \
+  -d '{":pub":0, ":secret":0, ":n":5, ":m":3, ":out1":0, ":out2":0}' \
+  --low_in '[":pub",":n",":m"]' --low_out '[":out1",":out2"]'
+```
+
+**With non-trivial relational invariant (inline `@@` annotation):**
+```bash
+# :temp is not low but affects :out; annotation supplies the cross-trace relation
+python3 chiron.py -rvl example/safe_annotated.tl \
+  -d '{":n":3, ":pub":10, ":secret":5, ":out":0, ":temp":0}' \
+  --low_in '[":pub",":n"]' --low_out '[":out"]'
+```
+
+**With `.inv` sidecar file:**
+```bash
+# safe_nontrivial_inv.inv sits alongside the .tl file and lists invariant expressions
+python3 chiron.py -rvl example/safe_nontrivial_inv.tl \
+  -d '{":n":3, ":pub":10, ":secret":5, ":out":0, ":temp":0}' \
+  --low_in '[":pub",":n"]' --low_out '[":out"]'
+```
+
+#### Turtle Path/Position Safety
+
+Declare `":turtle_x"` and/or `":turtle_y"` as low outputs to trigger turtle geometry checks. Two levels of check run automatically:
+- **Position safety** — can the final `(x, y)` position differ across traces?
+- **Path safety** — can any individual move's displacement vector differ?
 
 ```bash
-uv run chiron.py --help
-Chiron v5.3
+# Position and path both leak (move by secret amount)
+python3 chiron.py example/turtle_pos_leak.tl -rv \
+  -d '{":pub":0, ":secret":0}' \
+  --low_in '[":pub"]' --low_out '[":turtle_x",":turtle_y"]'
 
-    ░█████╗░██╗░░██╗██╗██████╗░░█████╗░███╗░░██╗
-    ██╔══██╗██║░░██║██║██╔══██╗██╔══██╗████╗░██║
-    ██║░░╚═╝███████║██║██████╔╝██║░░██║██╔██╗██║
-    ██║░░██╗██╔══██║██║██╔══██╗██║░░██║██║╚████║
-    ╚█████╔╝██║░░██║██║██║░░██║╚█████╔╝██║░╚███║
-    ░╚════╝░╚═╝░░╚═╝╚═╝╚═╝░░╚═╝░╚════╝░╚═╝░░╚══╝
-    
-usage: chiron.py [-h] [-p] [-r] [-gr] [-b] [-k] [-z] [-t TIMEOUT] [-d PARAMS] [-c CONSTPARAMS] [-se] [-ai] [-dfa] [-sbfl] [-bg BUGGY] [-vars INPUTVARSLIST] [-nt NTESTS] [-pop POPSIZE]
-                 [-cp CXPB] [-mp MUTPB] [-cfg_gen] [-cfg_dump] [-dump] [-ng NGEN] [-vb VERBOSE]
-                 progfl
+# Path leaks but final position is safe (forward pub+secret; backward secret)
+python3 chiron.py example/turtle_path_leak_pos_safe.tl -rv \
+  -d '{":pub":5, ":secret":0}' \
+  --low_in '[":pub"]' --low_out '[":turtle_x",":turtle_y"]'
 
-Program Analysis Framework for ChironLang Programs.
-
-positional arguments:
-  progfl
-
-options:
-  -h, --help            show this help message and exit
-  -p, --ir              pretty printing the IR of a Chiron program to stdout (terminal)
-  -r, --run             execute Chiron program, the figure/shapes the turle draws is shown in a UI.
-  -gr, --fuzzer_gen_rand
-                        Generate random input seeds for the fuzzer before fuzzing starts.
-  -b, --bin             load binary IR of a Chiron program
-  -k, --hooks           Run hooks for Kachua.
-  -z, --fuzz            Run fuzzer on a Chiron program (seed values with '-d' or '--params' flag needed.)
-  -t, --timeout TIMEOUT
-                        Timeout Parameter for Analysis (in secs). This is the total timeout.
-  -d, --params PARAMS   pass variable values to Chiron program in python dictionary format
-  -c, --constparams CONSTPARAMS
-                        pass variable(for which you have to find values using circuit equivalence) values to Chiron program in python dictionary format
-  -se, --symbolicExecution
-                        Run Symbolic Execution on a Chiron program (seed values with '-d' or '--params' flag needed) to generate test cases along all possible paths.
-  -ai, --abstractInterpretation
-                        Run abstract interpretation on a Chiron Program.
-  -dfa, --dataFlowAnalysis
-                        Run data flow analysis using worklist algorithm on a Chiron Program.
-  -sbfl, --SBFL         Run Spectrum-basedFault localizer on Chiron program
-  -bg, --buggy BUGGY    buggy Chiron program path
-  -vars, --inputVarsList INPUTVARSLIST
-                        A list of input variables of given Chiron program
-  -nt, --ntests NTESTS  number of tests to generate
-  -pop, --popsize POPSIZE
-                        population size for Genetic Algorithm.
-  -cp, --cxpb CXPB      cross-over probability
-  -mp, --mutpb MUTPB    mutation probability
-  -cfg_gen, --control_flow
-                        Generate the CFG of the given turtle program
-  -cfg_dump, --dump_cfg
-                        Generate the CFG of the given turtle program
-  -dump, --dump_ir      Dump the IR to a .kw (pickle file)
-  -ng, --ngen NGEN      number of times Genetic Algorithm iterates
-  -vb, --verbose VERBOSE
-                        To display computation to Console
+# Visual witness: zigzag amplitude proportional to :secret
+python3 chiron.py -rvl example/turtle_zigzag_leak.tl \
+  -d '{":n":12, ":pub":20, ":secret":0, ":out":0}' \
+  --low_in '[":pub",":n"]' --low_out '[":out",":turtle_x",":turtle_y"]'
+bash witness.sh   # launches two turtle windows side-by-side
 ```
 
+#### Timing Side-Channel Detection
+
+A secret-dependent loop bound leaks even if the body never writes a low output.
+
+```bash
+# Pure timing leak: bound = :secret, body only writes :temp (not low)
+python3 chiron.py example/timing_leak.tl -rvl \
+  -d '{":pub":0, ":secret":0, ":out":0}' \
+  --low_in '[":pub"]' --low_out '[":out"]'
+
+# Value + timing leak: bound = :secret, body writes :out (low)
+python3 chiron.py example/timing_value_leak.tl -rvl \
+  -d '{":pub":0, ":secret":0, ":out":0}' \
+  --low_in '[":pub"]' --low_out '[":out"]'
+```
+
+#### Symmetry-2
+
+Checks that swapping two named inputs does not change any low output. Tier is auto-detected.
+
+```bash
+# Tier 1 — straight-line (safe: addition is commutative)
+python3 chiron.py example/sym_safe.tl \
+  --sym '[":a", ":b"]' --low_out '[":out"]' \
+  -d '{":a": 0, ":b": 0, ":out": 0}'
+
+# Tier 1 — straight-line (not symmetric: extra :b)
+python3 chiron.py example/sym_leak.tl \
+  --sym '[":a", ":b"]' --low_out '[":out"]' \
+  -d '{":a": 0, ":b": 0, ":out": 0}'
+
+# Tier 1 — conditional max (symmetric)
+python3 chiron.py example/sym_cond_max.tl \
+  --sym '[":a", ":b"]' --low_out '[":out"]' \
+  -d '{":a": 0, ":b": 0, ":out": 0}'
+
+# Tier 2 — single loop (symmetric)
+python3 chiron.py example/sym_loop_cond_sym.tl \
+  --sym '[":a", ":b"]' --low_out '[":out"]' \
+  -d '{":a": 0, ":b": 0, ":n": 0, ":out": 0}'
+
+# Tier 2b — multiple loops (symmetric: both loops use :a+:b)
+python3 chiron.py example/sym_loop_commute.tl \
+  --sym '[":a", ":b"]' --low_out '[":out"]' \
+  -d '{":a":0, ":b":0, ":n":0, ":m":0, ":out":0}'
+
+# Tier 2b — multiple loops (not symmetric: second loop uses :b+:b)
+python3 chiron.py example/sym_loop_asym.tl \
+  --sym '[":a", ":b"]' --low_out '[":out"]' \
+  -d '{":a":0, ":b":0, ":n":0, ":m":0, ":out":0}'
+```
+
+#### Monotonicity
+
+Checks that increasing a named input never decreases any low output. Tier is auto-detected.
+
+```bash
+# Tier 1 — safe (net: out = pub + x, increasing in :x)
+python3 chiron.py example/mono_safe.tl \
+  --mono ':x' --low_out '[":out"]' \
+  -d '{":x": 0, ":pub": 0, ":out": 0, ":temp": 0}'
+
+# Tier 1 — not monotone (out = pub - x, decreasing in :x)
+python3 chiron.py example/mono_unsafe.tl \
+  --mono ':x' --low_out '[":out"]' \
+  -d '{":x": 0, ":pub": 0, ":out": 0}'
+
+# Tier 2 — single loop (safe: each iteration adds :x)
+python3 chiron.py example/mono_loop_safe.tl \
+  --mono ':x' --low_out '[":out"]' \
+  -d '{":x":0, ":n":0, ":out":0}'
+
+# Tier 2 — single loop (not monotone: each iteration subtracts :x)
+python3 chiron.py example/mono_loop_unsafe.tl \
+  --mono ':x' --low_out '[":out"]' \
+  -d '{":x":0, ":n":0, ":out":0}'
+
+# Tier 2b — multiple loops (safe: both loops add :x)
+python3 chiron.py example/mono_multiloop_safe.tl \
+  --mono ':x' --low_out '[":out"]' \
+  -d '{":x":0, ":n":0, ":m":0, ":out":0}'
+```
+
+#### Running All Tests at Once
+
+An automated test runner covers all symmetry and monotonicity examples:
+
+```bash
+cd ChironCore
+bash run_tests.sh
+```
+
+Output looks like:
+```
+============================================================
+SYMMETRY TESTS -- Tier 1 (straight-line / conditional)
+============================================================
+[PASS] sym_safe         → SYMMETRIC
+[PASS] sym_leak         → NOT SYMMETRIC
+[PASS] sym_cond_max     → SYMMETRIC
+...
+============================================================
+RESULTS: 14 passed, 0 failed out of 14 tests
+============================================================
+```
+
+---
+
+### Relational Invariant Annotations
+
+When an intermediate (non-low) variable indirectly affects a low output, the default invariant is too weak to prove safety. Two mechanisms supply stronger relational invariants.
+
+**Inline `@@` annotation** — written directly in the `.tl` file:
+```
+:out = 0
+:temp = :secret + :pub
+@@ :out
+@@ :temp - :secret
+repeat :n [ :out = :out + :temp - :secret ]
+```
+Each `@@ expr` line tells the verifier to assert `expr(trace1) = expr(trace2)` as part of the loop invariant.
+
+**`.inv` sidecar file** — a separate `prog.inv` file alongside `prog.tl`:
+```
+:out
+:__rep_counter_1
+:temp - :secret
+```
+Same semantics; useful when you don't want to modify the source program.
+
+Priority: `@@` annotations > `.inv` sidecar > auto-generated simple equality.
+
+---
+
+### CLI Flag Reference (Relational Verifier)
+
+| Flag | Description |
+|---|---|
+| `-rv` / `--relationalVerify` | Non-interference check, Tier 1 (straight-line + conditionals). Requires `-d` with all variables and `--low_in`, `--low_out`. |
+| `-rvl` / `--relationalVerifyLoop` | Non-interference check, Tier 2 and Tier 2b (single or multiple loops). Same requirements as `-rv`. |
+| `--low_in '[":v1", ...]'` | List of low (public) input variables. |
+| `--low_out '[":v1", ...]'` | List of low (public) output variables. Declare `":turtle_x"` / `":turtle_y"` here to enable turtle checks. |
+| `--sym '[":a", ":b"]'` | Symmetry-2 check: swap `:a` and `:b` between traces. Requires exactly two variables. Auto-dispatches across all tiers. |
+| `--mono ':x'` | Monotonicity check: trace 1 has smaller `:x`, trace 2 has larger. Auto-dispatches across all tiers. |
+| `-d '{":v": val, ...}'` | Initial variable values (all program variables must be listed). |
