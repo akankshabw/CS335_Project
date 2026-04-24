@@ -171,7 +171,7 @@ This extension adds a **relational verification** pass to Chiron that checks sec
 | Property | Question | Flag |
 |---|---|---|
 | **Non-interference** | Can secret inputs influence public outputs? | `-rv` / `-rvl` |
-| **Symmetry-2** | Does swapping two inputs change any output? | `--sym` |
+| **2-Symmetry** | Does swapping two inputs change any output? | `--sym` |
 | **Monotonicity** | Can increasing an input decrease any output? | `--mono` |
 
 All three properties are checked across three program tiers:
@@ -189,7 +189,7 @@ All three properties are checked across three program tiers:
 | `ChironCore/ChironAST/ChironAST.py` | **Modified.** Added `InvariantAnnotation` AST node. |
 | `ChironCore/ChironAST/builder.py` | **Modified.** Added `visitAnnotation` visitor method. |
 | `ChironCore/example/` | **New files.** 80+ test programs covering all tiers and properties. |
-| `ChironCore/run_tests.sh` | **New.** Automated test runner for symmetry and monotonicity examples. |
+| `ChironCore/run_tests.sh` | **New.** Automated test runner |
 
 ---
 
@@ -288,7 +288,7 @@ python3 chiron.py example/timing_value_leak.tl -rvl \
   --low_in '[":pub"]' --low_out '[":out"]'
 ```
 
-#### Symmetry-2
+#### 2-Symmetry
 
 Checks that swapping two named inputs does not change any low output. Tier is auto-detected.
 
@@ -357,27 +357,12 @@ python3 chiron.py example/mono_multiloop_safe.tl \
 
 #### Running All Tests at Once
 
-An automated test runner covers all symmetry and monotonicity examples:
+An automated test runner
 
 ```bash
 cd ChironCore
 bash run_tests.sh
 ```
-
-Output looks like:
-```
-============================================================
-SYMMETRY TESTS -- Tier 1 (straight-line / conditional)
-============================================================
-[PASS] sym_safe         → SYMMETRIC
-[PASS] sym_leak         → NOT SYMMETRIC
-[PASS] sym_cond_max     → SYMMETRIC
-...
-============================================================
-RESULTS: 14 passed, 0 failed out of 14 tests
-============================================================
-```
-
 ---
 
 ### Relational Invariant Annotations
@@ -414,6 +399,6 @@ Priority: `@@` annotations > `.inv` sidecar > auto-generated simple equality.
 | `-rvl` / `--relationalVerifyLoop` | Non-interference check, Tier 2 and Tier 2b (single or multiple loops). Same requirements as `-rv`. |
 | `--low_in '[":v1", ...]'` | List of low (public) input variables. |
 | `--low_out '[":v1", ...]'` | List of low (public) output variables. Declare `":turtle_x"` / `":turtle_y"` here to enable turtle checks. |
-| `--sym '[":a", ":b"]'` | Symmetry-2 check: swap `:a` and `:b` between traces. Requires exactly two variables. Auto-dispatches across all tiers. |
+| `--sym '[":a", ":b"]'` | 2-Symmetry check: swap `:a` and `:b` between traces. Requires exactly two variables. Auto-dispatches across all tiers. |
 | `--mono ':x'` | Monotonicity check: trace 1 has smaller `:x`, trace 2 has larger. Auto-dispatches across all tiers. |
 | `-d '{":v": val, ...}'` | Initial variable values (all program variables must be listed). |

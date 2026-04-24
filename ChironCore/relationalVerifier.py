@@ -281,7 +281,7 @@ def _show_relational_state(model, inv_exprs, ctx1, ctx2):
 def build_invariant(ctx1, ctx2, inv_var_names):
     """
     Build the relational invariant as a Z3 conjunction:
-      INV = /\\ { ctx1.v == ctx2.v  for v in inv_var_names }
+      INV = /\ { ctx1.v == ctx2.v  for v in inv_var_names }
     inv_var_names: plain strings without ':', e.g. ["out", "__rep_counter_0"]
     """
     clauses = [getattr(ctx1, v) == getattr(ctx2, v) for v in inv_var_names]
@@ -1102,9 +1102,6 @@ def _check_relational_loop(prop, irHandler, params, low_outputs,
     `entry_assumptions` is a list of extra Z3 constraints for Check 1
     (used when chaining multiple loops).
     """
-    extra = list({v for v in (prop.build_inv.__code__.co_freevars
-                               if hasattr(prop.build_inv, '__code__') else [])})
-
     # Determine inv_vars for fresh contexts
     # We pass extra_vars = all vars mentioned in input_constraints that aren't outputs
     out_set = {v.replace(":", "") for v in low_outputs}
@@ -1268,7 +1265,7 @@ def _check_relational_multi_loop(prop, irHandler, loops, params, low_outputs,
         def show_inv(m, c1, c2, _ie=inv_exprs, _iv=iv):
             _show_inv_generic(m, _ie, _iv, c1, c2)
 
-        # Check 1: Initialization (use real ctx, not fresh)
+        # Check 1: Initialization
         print(f"\n  --- {label} Check 1: Initialization ---")
         s1 = Solver()
         s1.add(*input_cs)
